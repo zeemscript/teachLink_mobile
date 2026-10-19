@@ -1,6 +1,9 @@
 import { useAppStore } from '../store';
-import mobileAuthService from './mobileAuth';
+import { useNotificationStore } from '../store/notificationStore';
 import logger from '../utils/logger';
+import { clearRefreshQueue } from './api/axios.config';
+import mobileAuthService from './mobileAuth';
+import { unregisterTokenFromBackend } from './pushNotifications';
 
 export type { AuthResult, AuthTokens, AuthUser, LoginCredentials } from './mobileAuth';
 
@@ -80,15 +83,23 @@ export async function login(credentials: {
  */
 export async function logout(): Promise<void> {
   const store = useAppStore.getState();
+  const { pushToken } = useNotificationStore.getState();
   store.setAuthLoading(true);
 
   try {
+    // Best-effort attempt to unregister the push token from the backend
+    if (pushToken) {
+      await unregisterTokenFromBackend(pushToken);
+    }
+
     await mobileAuthService.logout();
     store.logout();
+    clearRefreshQueue();
     logger.info('AuthService: logout successful');
   } catch (error) {
     // Still reset local state even if the API call fails
     store.logout();
+    clearRefreshQueue();
     logger.warn('AuthService: logout encountered an error, session cleared locally', error);
   } finally {
     store.setAuthLoading(false);

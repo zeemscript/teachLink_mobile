@@ -4,6 +4,7 @@ import { apiService } from './api';
 import { batchClient } from './api/batchClient';
 import { offlineStorage, SyncOperation, SyncOperationType } from './offlineStorage';
 import { syncEntityManager } from './sync/syncEntityManager';
+import { extractConflictPayload, isConflictError } from './sync/httpConflictDetection';
 import { useBookmarkStore } from '../store/bookmarkStore';
 import { useDeviceStore } from '../store/deviceStore';
 import { useSettingsStore } from '../store/settingsStore';
@@ -28,11 +29,8 @@ const MAX_AUTO_SYNC_BACKOFF_MS = 300_000;
 const CIRCUIT_OPEN_FAILURE_THRESHOLD = 5;
 const CIRCUIT_OPEN_MS = 600_000;
 
-// Conflict resolution strategies
-type LegacyConflictResolutionStrategy = 'serverWins' | 'clientWins' | 'merge' | 'manual';
-type ConflictResolutionStrategy =
-  | VersionedConflictResolutionStrategy
-  | LegacyConflictResolutionStrategy;
+// Conflict resolution strategies — legacy camelCase aliases are normalised
+// by the unified syncEntityManager pathway. No local resolution logic needed.
 
 // Sync event types
 type SyncEventType =
@@ -98,18 +96,18 @@ export class SyncService {
           this.stopAutoSync();
           this.startAutoSync();
         }
+      }
+    });
 
-        // If the app goes to background, stop auto-sync to conserve CPU/battery.
-        if (state.isInBackground !== prevState.isInBackground) {
-          logger.info(`SyncService: App background state changed to ${state.isInBackground}`);
-          if (state.isInBackground) {
-            this.stopAutoSync();
-            // also clear listeners to reduce memory usage while backgrounded
-            this.removeAllEventListeners();
-          } else {
-            // resumed to foreground
-            this.startAutoSync();
-          }
+    // Subscribe to app foreground/background state changes
+    useDeviceStore.subscribe((state: any, prevState: any) => {
+      if (state.isInBackground !== prevState.isInBackground) {
+        logger.info(`SyncService: App background state changed to ${state.isInBackground}`);
+        if (state.isInBackground) {
+          this.stopAutoSync();
+          this.removeAllEventListeners();
+        } else {
+          this.startAutoSync();
         }
       }
     });
@@ -522,14 +520,14 @@ export class SyncService {
   private recordSyncFailure(operation: SyncOperation, error: any): void {
     this.metrics.failedOperations += 1;
 
-    if (this.isConflictError(error)) {
+    if (isConflictError(error)) {
       this.metrics.conflictsDetected += 1;
       this.emitEvent({
         type: 'conflictDetected',
         operationId: operation.id,
         data: {
           operation,
-          serverData: this.extractConflictPayload(error),
+          serverData: extractConflictPayload(error),
           strategy: operation.conflictStrategy ?? 'server-wins',
         },
         error,
@@ -538,19 +536,13 @@ export class SyncService {
     }
   }
 
-  private isConflictError(error: any): boolean {
-    return error?.status === 409 || error?.response?.status === 409 || error?.code === 'CONFLICT';
-  }
-
-  private extractConflictPayload(error: any): any {
-    return error?.response?.data ?? error?.data ?? error?.body ?? null;
-  }
-
   /**
-   * Add event listener
+   * Add event listener. Duplicate listeners are ignored.
    */
   addEventListener(listener: (event: SyncEvent) => void): void {
-    this.eventListeners.push(listener);
+    if (!this.eventListeners.includes(listener)) {
+      this.eventListeners.push(listener);
+    }
   }
 
   /**
@@ -561,6 +553,13 @@ export class SyncService {
     if (index > -1) {
       this.eventListeners.splice(index, 1);
     }
+  }
+
+  /**
+   * Check if a listener is already registered
+   */
+  hasEventListener(listener: (event: SyncEvent) => void): boolean {
+    return this.eventListeners.includes(listener);
   }
 
   removeAllEventListeners(): void {
@@ -604,31 +603,28 @@ export class SyncService {
   }
 
   /**
-   * Resolve conflicts using specified strategy
+   * Resolve conflicts using the unified syncEntityManager pathway.
+   * Delegates to syncEntityManager.resolveRawConflict for raw data,
+   * or syncEntityManager.handleServerEntity for versioned entities.
    */
   async resolveConflicts(
     localData: any,
     serverData: any,
-    strategy: ConflictResolutionStrategy = 'server-wins',
+    strategy: VersionedConflictResolutionStrategy = 'server-wins',
     baseData?: any
   ): Promise<any> {
-    const normalizedStrategy = this.normalizeConflictStrategy(strategy);
     this.metrics.conflictsDetected += 1;
 
     this.emitEvent({
       type: 'conflictDetected',
-      data: { localData, serverData, strategy: normalizedStrategy },
+      data: { localData, serverData, strategy },
       timestamp: Date.now(),
     });
-
-    if (strategy === 'manual') {
-      return { local: localData, server: serverData, base: baseData };
-    }
 
     const result = syncEntityManager.resolveRawConflict(
       localData,
       serverData,
-      normalizedStrategy,
+      strategy,
       baseData
     );
 
@@ -643,29 +639,14 @@ export class SyncService {
 
   /**
    * Resolve a versioned conflict and persist the result in the version store.
+   * Delegates to syncEntityManager.handleServerEntity.
    */
   resolveVersionedConflict<T extends Record<string, unknown>>(
     serverEntity: VersionedEntity<T>,
-    strategy: ConflictResolutionStrategy = 'merge',
+    strategy: VersionedConflictResolutionStrategy = 'merge',
     baseEntity?: VersionedEntity<T>
   ) {
-    const normalizedStrategy = this.normalizeConflictStrategy(strategy);
-    return syncEntityManager.handleServerEntity(serverEntity, normalizedStrategy, baseEntity);
-  }
-
-  private normalizeConflictStrategy(
-    strategy: ConflictResolutionStrategy
-  ): VersionedConflictResolutionStrategy {
-    switch (strategy) {
-      case 'serverWins':
-        return 'server-wins';
-      case 'clientWins':
-        return 'client-wins';
-      case 'manual':
-        return 'server-wins';
-      default:
-        return strategy;
-    }
+    return syncEntityManager.handleServerEntity(serverEntity, strategy, baseEntity);
   }
 
   /**

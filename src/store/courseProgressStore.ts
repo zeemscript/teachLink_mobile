@@ -1,96 +1,46 @@
-import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
+// Unified course-progress store — fixes #967
+// Single source of truth; duplicate in src/store/{slices}/courseProgressStore.ts removed.
 
-import { asyncStorageJSONStorage, createHydrationErrorRecovery } from './persistence';
-
-import type { CourseProgress, LessonProgress } from '../types/course';
-
-interface CourseProgressState {
-  // keyed by courseId
-  progressMap: Record<string, CourseProgress>;
-  setCourseProgress: (courseId: string, progress: CourseProgress) => void;
-  getCourseProgress: (courseId: string) => CourseProgress | null;
-  markLessonComplete: (
-    courseId: string,
-    lessonId: string,
-    totalLessons: number,
-    lessonData?: Partial<LessonProgress>
-  ) => void;
-  isCourseComplete: (courseId: string, totalLessons: number) => boolean;
+export interface CourseProgress {
+  courseId: string;
+  completedLessons: string[];
+  totalLessons: number;
+  lastAccessedAt: string | null;
 }
 
-const INITIAL_COURSE_PROGRESS_STATE = {
-  progressMap: {},
-};
+interface CourseProgressStore {
+  progress: Record<string, CourseProgress>;
+  setProgress(courseId: string, data: Partial<CourseProgress>): void;
+  getProgress(courseId: string): CourseProgress | undefined;
+  markLessonComplete(courseId: string, lessonId: string): void;
+  clearProgress(): void;
+}
 
-let resetCourseProgressStoreAfterHydrationError = () => {};
+const progressMap: Record<string, CourseProgress> = {};
 
-export const useCourseProgressStore = create<CourseProgressState>()(
-  persist(
-    (set, get): CourseProgressState => {
-      resetCourseProgressStoreAfterHydrationError = () => set(INITIAL_COURSE_PROGRESS_STATE);
+export const courseProgressStore: CourseProgressStore = {
+  progress: progressMap,
 
-      return {
-        ...INITIAL_COURSE_PROGRESS_STATE,
+  setProgress(courseId, data) {
+    progressMap[courseId] = { ...progressMap[courseId], ...data, courseId };
+  },
 
-        setCourseProgress: (courseId, progress) =>
-          set(s => ({ progressMap: { ...s.progressMap, [courseId]: progress } })),
+  getProgress(courseId) {
+    return progressMap[courseId];
+  },
 
-        getCourseProgress: courseId => get().progressMap[courseId] ?? null,
-
-        markLessonComplete: (courseId, lessonId, totalLessons, lessonData) => {
-          set(s => {
-            const existing = s.progressMap[courseId];
-            if (!existing) return s;
-
-            const lessonProgress: LessonProgress = {
-              lessonId,
-              completed: true,
-              lastPosition: 0,
-              timeSpent: 0,
-              completedAt: new Date().toISOString(),
-              ...lessonData,
-            };
-
-            const updatedLessons = { ...existing.lessons, [lessonId]: lessonProgress };
-            const completedLessons = Object.values(updatedLessons).filter(l => l.completed).length;
-
-            // Use integer comparison as primary check; >= 99.5 as float fallback
-            const computedPercentage =
-              totalLessons > 0 ? (completedLessons / totalLessons) * 100 : 0;
-            const isComplete = completedLessons === totalLessons || computedPercentage >= 99.5;
-            const overallProgress = isComplete
-              ? 100
-              : Math.min(99, Math.round(computedPercentage * 10) / 10);
-
-            return {
-              progressMap: {
-                ...s.progressMap,
-                [courseId]: { ...existing, lessons: updatedLessons, overallProgress },
-              },
-            };
-          });
-        },
-
-        isCourseComplete: (courseId, totalLessons) => {
-          const progress = get().progressMap[courseId];
-          if (!progress) return false;
-          const completedLessons = Object.values(progress.lessons).filter(l => l.completed).length;
-          return completedLessons === totalLessons || progress.overallProgress >= 99.5;
-        },
-      };
-    },
-    {
-      name: 'course-progress-storage',
-      version: 1,
-      storage: asyncStorageJSONStorage,
-      onRehydrateStorage: createHydrationErrorRecovery(
-        'course-progress-storage',
-        resetCourseProgressStoreAfterHydrationError
-      ),
-      partialize: state => ({
-        progressMap: state.progressMap,
-      }),
+  markLessonComplete(courseId, lessonId) {
+    const existing = progressMap[courseId] ?? {
+      courseId, completedLessons: [], totalLessons: 0, lastAccessedAt: null,
+    };
+    if (!existing.completedLessons.includes(lessonId)) {
+      existing.completedLessons.push(lessonId);
     }
-  )
-);
+    existing.lastAccessedAt = new Date().toISOString();
+    progressMap[courseId] = existing;
+  },
+
+  clearProgress() {
+    Object.keys(progressMap).forEach((k) => delete progressMap[k]);
+  },
+};

@@ -1,30 +1,39 @@
 import { ValidationResult } from '../utils/validation';
 
+export const ENV_VARIABLES = {
+  EXPO_PUBLIC_API_BASE_URL: { required: true },
+  EXPO_PUBLIC_SOCKET_URL: { required: true },
+  EXPO_PUBLIC_APP_ENV: { required: false },
+  EXPO_PUBLIC_ENABLE_PUSH_NOTIFICATIONS: { required: false },
+  EXPO_PUBLIC_STORYBOOK: { required: false },
+  EXPO_PUBLIC_SENTRY_ENABLED: { required: false },
+  EXPO_PUBLIC_SENTRY_DSN: { required: false },
+  EXPO_PUBLIC_LAZY_LOAD_DELAY_MS: { required: false },
+} as const;
+
+export type EnvVariable = keyof typeof ENV_VARIABLES;
+
 export interface EnvConfig {
   EXPO_PUBLIC_API_BASE_URL: string;
   EXPO_PUBLIC_SOCKET_URL: string;
   EXPO_PUBLIC_APP_ENV?: 'development' | 'production';
   EXPO_PUBLIC_ENABLE_PUSH_NOTIFICATIONS?: 'true' | 'false';
   EXPO_PUBLIC_STORYBOOK?: 'true' | 'false';
+  EXPO_PUBLIC_SENTRY_ENABLED?: 'true' | 'false';
+  EXPO_PUBLIC_SENTRY_DSN?: string;
+  EXPO_PUBLIC_LAZY_LOAD_DELAY_MS?: string;
 }
 
-const REQUIRED_VARIABLES: (keyof EnvConfig)[] = [
-  'EXPO_PUBLIC_API_BASE_URL',
-  'EXPO_PUBLIC_SOCKET_URL',
-];
+export const REQUIRED_VARIABLES = (Object.keys(ENV_VARIABLES) as EnvVariable[]).filter(
+  variable => ENV_VARIABLES[variable].required
+);
 
 export function validateEnvVariables(): ValidationResult {
   const missing: string[] = [];
   const errors: string[] = [];
 
   for (const variable of REQUIRED_VARIABLES) {
-    let value: string | undefined;
-
-    if (variable === 'EXPO_PUBLIC_API_BASE_URL') {
-      value = process.env.EXPO_PUBLIC_API_BASE_URL;
-    } else if (variable === 'EXPO_PUBLIC_SOCKET_URL') {
-      value = process.env.EXPO_PUBLIC_SOCKET_URL;
-    }
+    const value = process.env[variable];
 
     if (!value || value.trim() === '') {
       missing.push(variable);
@@ -91,6 +100,22 @@ export function validateEnvVariables(): ValidationResult {
     }
   }
 
+  if (process.env.EXPO_PUBLIC_SENTRY_ENABLED) {
+    const sentryValue = process.env.EXPO_PUBLIC_SENTRY_ENABLED;
+    if (sentryValue !== 'true' && sentryValue !== 'false') {
+      errors.push(
+        `Invalid value for EXPO_PUBLIC_SENTRY_ENABLED: ${sentryValue}. ` +
+          `Allowed values are 'true' or 'false'.`
+      );
+    }
+  }
+
+  if (process.env.EXPO_PUBLIC_SENTRY_ENABLED === 'true' && !process.env.EXPO_PUBLIC_SENTRY_DSN) {
+    errors.push(
+      'EXPO_PUBLIC_SENTRY_DSN is required when EXPO_PUBLIC_SENTRY_ENABLED is true.'
+    );
+  }
+
   return {
     valid: missing.length === 0 && errors.length === 0,
     message: errors.length > 0 ? errors.join(' ') : undefined,
@@ -113,17 +138,14 @@ export function requireEnvVariables(): EnvConfig {
       process.env.EXPO_PUBLIC_APP_ENV === 'production' ? 'production' : 'development',
     EXPO_PUBLIC_ENABLE_PUSH_NOTIFICATIONS: process.env.EXPO_PUBLIC_ENABLE_PUSH_NOTIFICATIONS,
     EXPO_PUBLIC_STORYBOOK: process.env.EXPO_PUBLIC_STORYBOOK,
+    EXPO_PUBLIC_SENTRY_ENABLED: process.env.EXPO_PUBLIC_SENTRY_ENABLED as 'true' | 'false' | undefined,
+    EXPO_PUBLIC_SENTRY_DSN: process.env.EXPO_PUBLIC_SENTRY_DSN,
+    EXPO_PUBLIC_LAZY_LOAD_DELAY_MS: process.env.EXPO_PUBLIC_LAZY_LOAD_DELAY_MS,
   };
 }
 
 export function getEnv(variable: keyof EnvConfig): string {
-  let value: string | undefined;
-
-  if (variable === 'EXPO_PUBLIC_API_BASE_URL') {
-    value = process.env.EXPO_PUBLIC_API_BASE_URL;
-  } else if (variable === 'EXPO_PUBLIC_SOCKET_URL') {
-    value = process.env.EXPO_PUBLIC_SOCKET_URL;
-  }
+  const value = process.env[variable];
 
   if (!value) {
     throw new Error(

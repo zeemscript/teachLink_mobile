@@ -1,10 +1,12 @@
 import Constants from 'expo-constants';
 import { isDevice } from 'expo-device';
 import * as Notifications from 'expo-notifications';
-import { Platform } from 'react-native';
+import { AppState, AppStateStatus, Platform } from 'react-native';
 
 import { featureCapabilities, FeatureStatus, FeatureType } from './featureCapabilities';
+import apiClient from './api/axios.config';
 import { useDegradationStore } from '../store/degradationStore';
+import { useNotificationStore } from '../store/notificationStore';
 import { NotificationData, NotificationType } from '../types/notifications';
 import logger from '../utils/logger';
 
@@ -204,37 +206,39 @@ export function getChannelId(type: NotificationType): string {
  */
 export async function registerTokenWithBackend(token: string): Promise<boolean> {
   try {
-    // TODO: Replace with actual API endpoint
-    // const response = await apiClient.post('/api/notifications/register', {
-    //   token,
-    //   platform: Platform.OS,
-    // });
-    // return response.data.success;
+    await apiClient.post('/api/notifications/register', {
+      token,
+      platform: Platform.OS,
+    });
 
-    logger.info('Push token registered:', token);
+    logger.info('Push token registered with backend:', token);
     return true;
   } catch (error) {
     logger.error('Error registering token with backend:', error);
+    // Surface the error to Sentry without blocking the UI
+    if (error.response) {
+      logger.error('Backend registration failed with status:', error.response.status);
+    }
     return false;
   }
 }
 
 /**
- * Unregister push token from backend server
- * TODO: Implement actual API call when backend is ready
+ * Unregister push token from backend server.
+ * Called during logout (including session-expiry logout) to prevent
+ * the user from receiving push notifications after signing out.
+ *
+ * Calls DELETE /api/notifications/tokens/:token
  */
 export async function unregisterTokenFromBackend(token: string): Promise<boolean> {
   try {
-    // TODO: Replace with actual API endpoint
-    // const response = await apiClient.delete('/api/notifications/unregister', {
-    //   data: { token },
-    // });
-    // return response.data.success;
-
-    logger.info('Push token unregistered:', token);
+    await apiClient.delete(`/api/notifications/tokens/${encodeURIComponent(token)}`);
+    logger.info('Push token unregistered from backend');
     return true;
   } catch (error) {
     logger.error('Error unregistering token from backend:', error);
+    // Return false but do not re-throw — caller should still proceed with
+    // local token cleanup so a network failure never blocks logout.
     return false;
   }
 }
@@ -337,4 +341,96 @@ export function removeNotificationListener(subscription: Notifications.Subscript
  */
 export async function getLastNotificationResponse(): Promise<Notifications.NotificationResponse | null> {
   return await Notifications.getLastNotificationResponseAsync();
+}
+
+/**
+ * Fetch unread notification count from the server and sync badge.
+ * Falls back silently on network error.
+ */
+export async function syncBadgeFromServer(): Promise<void> {
+  try {
+    // TODO: Replace with actual API call when backend is ready
+    // const response = await apiClient.get('/api/notifications/unread-count');
+    // const unreadCount = response.data.count;
+    const unreadCount = useNotificationStore.getState().unreadCount;
+    useNotificationStore.getState().syncBadgeFromServer(unreadCount);
+    await Notifications.setBadgeCountAsync(unreadCount);
+  } catch (error) {
+    logger.warn('Failed to sync badge from server:', error);
+  }
+}
+
+let appStateSubscription: { remove: () => void } | null = null;
+
+// #812: Module-level guard prevents token-refresh listeners from accumulating
+// across multiple app launches / background restores. Only one listener is ever
+// registered; subsequent calls return the existing cleanup without adding a new one.
+let tokenExpirySubscription: import('expo-notifications').Subscription | null = null;
+
+/**
+ * Subscribe to Expo push token changes (token rotation / expiry).
+ *
+ * expo-notifications fires `addPushTokenListener` whenever the OS issues a new
+ * push token for the app — e.g. after a token reset or app reinstall.
+ * We re-register the fresh token with the backend automatically.
+ *
+ * Guards against accumulation: if called multiple times (re-renders, app
+ * restore) only one listener is ever active at a time.
+ */
+export function setupTokenExpiryListener(): () => void {
+  if (tokenExpirySubscription !== null) {
+    // Already registered — skip to prevent duplicate handlers on re-launch
+    return () => {
+      /* no-op: listener was already registered by an earlier call */
+    };
+  }
+
+  const Notifications = require('expo-notifications') as typeof import('expo-notifications');
+  tokenExpirySubscription = Notifications.addPushTokenListener(async tokenData => {
+    try {
+      await registerTokenWithBackend(tokenData.data);
+      logger.info('Push token rotated and re-registered with backend');
+    } catch (error) {
+      logger.error('Failed to re-register rotated push token:', error);
+    }
+  });
+
+  return () => {
+    if (tokenExpirySubscription) {
+      tokenExpirySubscription.remove();
+      tokenExpirySubscription = null;
+    }
+  };
+}
+
+/**
+ * Subscribe to AppState changes and sync badges on foreground.
+ * Should be called once during app initialization.
+ */
+export function setupForegroundBadgeSync(): () => void {
+  if (appStateSubscription) {
+    // Already subscribed — return existing cleanup rather than removing and
+    // re-adding, which would cause double-fire on the next app restore.
+    return () => {
+      if (appStateSubscription) {
+        appStateSubscription.remove();
+        appStateSubscription = null;
+      }
+    };
+  }
+
+  const handleAppStateChange = (nextState: AppStateStatus) => {
+    if (nextState === 'active') {
+      syncBadgeFromServer();
+    }
+  };
+
+  appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+
+  return () => {
+    if (appStateSubscription) {
+      appStateSubscription.remove();
+      appStateSubscription = null;
+    }
+  };
 }

@@ -1,0 +1,80 @@
+# Governance
+
+This folder holds the **governance** of this TeachLink repository: the documents,
+policies, roles, and processes that define how the project is run, how decisions
+are made, and how contributors participate.
+
+Everything in `Governance/` is documentation and policy. It is self-contained:
+changes to governance are made **only** inside this folder and do not affect
+application code.
+
+## Purpose
+
+- Make the project's decision-making transparent and predictable.
+- Define clear roles, responsibilities, and expectations for contributors and maintainers.
+- Give the community a single, versioned home for policies (contribution, conduct,
+  security disclosure, releases, licensing, and on-chain/community governance).
+
+## Foundational governance
+
+The project charter is the primary governing document for this repository and
+establishes the project's purpose, authority, and amendment process. See
+[`CHARTER.md`](CHARTER.md) for the current, versioned charter.
+
+## Structure
+
+The governance documents are organised into the following areas. Individual
+documents are added and refined over time (tracked as issues):
+
+- **Templates** — contributor and maintainer starting points, including the
+  [`Templates/BUG_REPORT_TEMPLATE.md`](templates/BUG_REPORT_TEMPLATE.md) for
+  reporting app defects and the
+  [`Templates/PR_DESCRIPTION_TEMPLATE.md`](templates/PR_DESCRIPTION_TEMPLATE.md)
+  for pull request descriptions.
+- **Foundations** — charter, mission, values, principles, and glossary.
+- **Roles & membership** — contributor ladder, maintainer/reviewer roles, and the
+  onboarding/offboarding lifecycle. The moderator role — duties, powers and
+  limits, and appointment and removal — is defined in
+  [`roles/MODERATOR.md`](roles/MODERATOR.md).
+- **Decision-making** — consensus and voting rules, the RFC/proposal process, and
+  decision records.
+- **Community & conduct** — code of conduct, enforcement, moderation (see
+  [`roles/MODERATOR.md`](roles/MODERATOR.md)), and conflict resolution.
+- **Contribution governance** — review policy, triage, labels, and roadmap governance.
+- **Security & disclosure** — vulnerability reporting, embargo, and advisory processes.
+- **Releases & change** — versioning, release cadence, deprecation, change policy, and
+  OS version support (minimum versions, drop criteria, and notice period — see
+  [`domains/OS_VERSION_SUPPORT.md`](domains/OS_VERSION_SUPPORT.md)).
+- **Legal & IP** — licensing, contributor sign-off, trademark, and attribution.
+- **Community & on-chain governance** — treasury, grants, and proposal governance.
+
+## Domain documents
+Domain-specific policies live in `Governance/domains/`. Each document ir
+self-contained and versioned with the repository:
+
+- `domains/APP_REVIEW_COMPLIANCE.md` — store guideline checklist, pre-submission
+  review, and rejection handling for app store submissions.
+- `domains/APP_VERSION_BUMP.md` — build-number and version-name rules.
+- `domains/BACKGROUND_TASK_GOVERNANCE.md` — background task ownership and limits.
+- `domains/BIOMETRIC_AUTN.md` — biometric authentication requirements.
+-  `domains/DEVICE_SUPPORT.md` — supported device tiers and testing matrix.
+-  `domains/EAS_BUILD_GOVERNANCE.md` — EAS build profiles, secrets, and promotion.
+-  `domains/MOBILE_ACCESSIBILITY.md` — accessibility targets and merge gate.
+-  `domains/MOBILE_FEATURE_FLAGS.md` — feature-flag lifecycle and ownership.
+-  `domains/MOBILE_TELEMETRY.md` — telemetry consent, PII exclusion, and crash reports.
+-  `domains/STORYBOOK_GOVERNANCE.md` — Storybook usage and maintenance.
+
+## Matrices
+
+Matrices live in `Governance/matrices/`. Each matrix is a versioned,
+self-contained reference that maps a governance area to concrete roles and
+access rules:
+
+- `matrices/DATA_ACCESS_MATRIX.md` — data classifications, roles, allowed
+  access per role, and review cadence for TeachLink Mobile.
+
+## Contributing to governance
+
+Proposals to add or change governance are made by opening an issue or a pull
+request that touches **only** this `Governance/` folder. Keep changes small and
+focused (at most two files), and document what changed.

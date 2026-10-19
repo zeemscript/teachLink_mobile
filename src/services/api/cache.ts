@@ -1,5 +1,9 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { InteractionManager } from 'react-native';
 
+import { resolveEndpointPersistence } from '../../config/apiCacheConfig';
+import { runWithConcurrency } from '../../utils/concurrency';
+import { encryptedGetItem, encryptedSetItem } from '../../utils/encryptedStorage';
 import { AnalyticsEvent } from '../../utils/trackingEvents';
 import { mobileAnalyticsService } from '../mobileAnalytics';
 
@@ -11,6 +15,9 @@ export interface CacheOptions {
   tags?: string[];
   dataType?: string;
   critical?: boolean;
+  persist?: boolean;
+  sensitive?: boolean;
+  encrypted?: boolean;
 }
 
 interface CacheEntry<T> {
@@ -22,7 +29,11 @@ interface CacheEntry<T> {
   tags: string[];
   dataType: string;
   critical: boolean;
+  persist: boolean;
+  sensitive: boolean;
+  encrypted: boolean;
   sizeBytes: number; // calculated size of this entry
+  lastAccessedAt: number; // timestamp of last read or write for LRU eviction
 }
 
 interface PersistedCacheEnvelope<T> {
@@ -33,7 +44,6 @@ interface PersistedCacheEnvelope<T> {
 
 const CACHE_STORAGE_PREFIX = '@teachlink/api-cache:';
 const CACHE_ANALYTICS_INTERVAL_MS = 30_000;
-const CACHE_ANALYTICS_OPERATION_INTERVAL = 10;
 
 const store = new Map<string, CacheEntry<unknown>>();
 let currentCacheSize = 0;
@@ -46,11 +56,15 @@ let storageHits = 0;
 let networkFetches = 0;
 let backgroundRevalidations = 0;
 let invalidations = 0;
-let operationsSinceAnalytics = 0;
+let evictions = 0;
 let lastAnalyticsAt = 0;
 
 const revalidatingKeys = new Set<string>();
 const cacheStatusListeners = new Set<() => void>();
+
+// In-memory index of persisted cache keys to their tags and dataType,
+// so invalidatePersistentWhere can evaluate predicates without reading bodies.
+const persistentKeyIndex = new Map<string, { tags: string[]; dataType: string }>();
 
 export interface CacheStatus {
   key: string;
@@ -68,21 +82,31 @@ function storageKeyFor(key: string): string {
   return `${CACHE_STORAGE_PREFIX}${encodeURIComponent(key)}`;
 }
 
-function normalizeOptions(options?: string | CacheOptions): Required<CacheOptions> {
+function normalizeOptions(
+  options: string | CacheOptions | undefined,
+  key: string
+): Required<CacheOptions> {
   if (typeof options === 'string') {
     return {
       dataVersion: options,
       tags: [],
       dataType: 'generic',
       critical: false,
+      persist: resolveEndpointPersistence(key),
+      sensitive: false,
+      encrypted: false,
     };
   }
 
+  const sensitive = options?.sensitive ?? false;
   return {
     dataVersion: options?.dataVersion,
     tags: options?.tags ?? [],
     dataType: options?.dataType ?? 'generic',
     critical: options?.critical ?? false,
+    persist: !sensitive && (options?.persist ?? resolveEndpointPersistence(key)),
+    sensitive,
+    encrypted: options?.encrypted ?? false,
   };
 }
 
@@ -107,6 +131,7 @@ export function getCacheStats() {
     networkFetches,
     backgroundRevalidations,
     invalidations,
+    evictions,
     networkReductionRate,
     sizeBytes: currentCacheSize,
     entryCount: store.size,
@@ -121,7 +146,7 @@ export function resetCacheStats(): void {
   networkFetches = 0;
   backgroundRevalidations = 0;
   invalidations = 0;
-  operationsSinceAnalytics = 0;
+  evictions = 0;
   lastAnalyticsAt = 0;
 }
 
@@ -236,9 +261,31 @@ export function estimateSize(obj: any, visited = new Set<any>()): number {
 
 function evictToLimit(): void {
   while (currentCacheSize > maxCacheSizeBytes && store.size > 0) {
-    const oldestKey = store.keys().next().value;
+    // Find the least recently used non-critical entry
+    let oldestKey: string | undefined;
+    let oldestAccess = Infinity;
+
+    for (const [key, entry] of store) {
+      if (entry.critical) continue; // Skip critical entries
+      if (entry.lastAccessedAt < oldestAccess) {
+        oldestAccess = entry.lastAccessedAt;
+        oldestKey = key;
+      }
+    }
+
+    // If all remaining entries are critical, find the oldest critical one
+    if (oldestKey === undefined) {
+      for (const [key, entry] of store) {
+        if (entry.lastAccessedAt < oldestAccess) {
+          oldestAccess = entry.lastAccessedAt;
+          oldestKey = key;
+        }
+      }
+    }
+
     if (oldestKey !== undefined) {
       removeMemoryEntry(oldestKey);
+      evictions++;
     } else {
       break;
     }
@@ -266,6 +313,7 @@ function removeMemoryEntry(key: string): boolean {
 
 function putMemoryEntry<T>(key: string, entry: CacheEntry<T>): void {
   removeMemoryEntry(key);
+  entry.lastAccessedAt = Date.now();
   store.set(key, entry as CacheEntry<unknown>);
   currentCacheSize += entry.sizeBytes;
   evictToLimit();
@@ -283,7 +331,8 @@ function getMemoryEntry<T>(key: string): CacheEntry<T> | null {
     return null;
   }
 
-  // LRU behavior: move to the end of the Map
+  // LRU behavior: update lastAccessedAt and move to the end of the Map
+  entry.lastAccessedAt = Date.now();
   store.delete(key);
   store.set(key, entry as CacheEntry<unknown>);
 
@@ -311,17 +360,11 @@ function recordNetworkFetch(): void {
 }
 
 function maybeReportCacheStats(reason: string): void {
-  operationsSinceAnalytics++;
-
   const now = Date.now();
-  if (
-    operationsSinceAnalytics < CACHE_ANALYTICS_OPERATION_INTERVAL &&
-    now - lastAnalyticsAt < CACHE_ANALYTICS_INTERVAL_MS
-  ) {
+  if (now - lastAnalyticsAt < CACHE_ANALYTICS_INTERVAL_MS) {
     return;
   }
 
-  operationsSinceAnalytics = 0;
   lastAnalyticsAt = now;
 
   const stats = getCacheStats();
@@ -342,13 +385,25 @@ function maybeReportCacheStats(reason: string): void {
 }
 
 async function persistCacheEntry<T>(key: string, entry: CacheEntry<T>): Promise<void> {
+  if (!entry.persist || entry.sensitive) {
+    return;
+  }
+
   try {
     const envelope: PersistedCacheEnvelope<T> = {
       schemaVersion: 1,
       key,
       entry,
     };
-    await AsyncStorage.setItem(storageKeyFor(key), JSON.stringify(envelope));
+    const storageKey = storageKeyFor(key);
+    const serialized = JSON.stringify(envelope);
+    if (entry.encrypted) {
+      await encryptedSetItem(storageKey, serialized);
+    } else {
+      await AsyncStorage.setItem(storageKey, serialized);
+    }
+    // Update the in-memory index
+    persistentKeyIndex.set(key, { tags: entry.tags, dataType: entry.dataType });
   } catch {
     // Some response bodies may not be serializable. Keep the memory tier.
   }
@@ -356,13 +411,31 @@ async function persistCacheEntry<T>(key: string, entry: CacheEntry<T>): Promise<
 
 async function readPersistentCache<T>(key: string): Promise<CacheEntry<T> | null> {
   try {
-    const raw = await AsyncStorage.getItem(storageKeyFor(key));
+    const storageKey = storageKeyFor(key);
+    const raw = await AsyncStorage.getItem(storageKey);
     if (!raw) {
       return null;
     }
 
-    const envelope = JSON.parse(raw) as PersistedCacheEnvelope<T>;
-    if (envelope.schemaVersion !== 1 || envelope.key !== key || !envelope.entry) {
+    let envelope: PersistedCacheEnvelope<T>;
+    try {
+      envelope = JSON.parse(raw) as PersistedCacheEnvelope<T>;
+    } catch {
+      const decrypted = await encryptedGetItem(storageKey);
+      if (!decrypted) {
+        await removePersistentCache(key);
+        return null;
+      }
+      envelope = JSON.parse(decrypted) as PersistedCacheEnvelope<T>;
+    }
+
+    if (
+      envelope.schemaVersion !== 1 ||
+      envelope.key !== key ||
+      !envelope.entry ||
+      envelope.entry.persist !== true ||
+      envelope.entry.sensitive === true
+    ) {
       await removePersistentCache(key);
       return null;
     }
@@ -382,6 +455,7 @@ async function readPersistentCache<T>(key: string): Promise<CacheEntry<T> | null
 async function removePersistentCache(key: string): Promise<void> {
   try {
     await AsyncStorage.removeItem(storageKeyFor(key));
+    persistentKeyIndex.delete(key);
   } catch {
     /* ignore storage cleanup errors */
   }
@@ -399,23 +473,56 @@ async function getPersistentCacheKeys(): Promise<string[]> {
 async function invalidatePersistentWhere(
   predicate: (key: string, entry: CacheEntry<unknown>) => boolean
 ): Promise<void> {
-  const keys = await getPersistentCacheKeys();
+  const keysToRemove: string[] = [];
 
-  await Promise.all(
-    keys.map(async storageKey => {
-      const encodedKey = storageKey.slice(CACHE_STORAGE_PREFIX.length);
-      const cacheKey = decodeURIComponent(encodedKey);
-      const entry = await readPersistentCache(cacheKey);
-      if (entry && predicate(cacheKey, entry as CacheEntry<unknown>)) {
-        await AsyncStorage.removeItem(storageKey);
-      }
-    })
-  );
+  for (const [key, indexEntry] of persistentKeyIndex) {
+    const mockEntry = {
+      data: null,
+      cachedAt: 0,
+      ttl: 0,
+      staleTtl: 0,
+      tags: indexEntry.tags,
+      dataType: indexEntry.dataType,
+      critical: false,
+      persist: true,
+      sensitive: false,
+      encrypted: false,
+      sizeBytes: 0,
+    } as CacheEntry<unknown>;
+
+    if (predicate(key, mockEntry)) {
+      keysToRemove.push(key);
+    }
+  }
+
+  if (keysToRemove.length === 0) return;
+
+  InteractionManager.runAfterInteractions(async () => {
+    const storageKeys = keysToRemove.map(key => storageKeyFor(key));
+    try {
+      await AsyncStorage.multiRemove(storageKeys);
+    } catch {
+      await runWithConcurrency(keysToRemove, key => removePersistentCache(key));
+    }
+
+    for (const key of keysToRemove) {
+      persistentKeyIndex.delete(key);
+    }
+  });
 }
 
 export async function clearPersistentCache(): Promise<void> {
   const keys = await getPersistentCacheKeys();
-  await Promise.all(keys.map(key => AsyncStorage.removeItem(key)));
+  if (keys.length === 0) return;
+
+  InteractionManager.runAfterInteractions(async () => {
+    try {
+      await AsyncStorage.multiRemove(keys);
+    } catch {
+      await runWithConcurrency(keys, key => AsyncStorage.removeItem(key));
+    }
+    persistentKeyIndex.clear();
+  });
 }
 
 export function getCache<T>(key: string): T | null {
@@ -443,7 +550,7 @@ export function setCache<T>(
   staleTtl: number,
   dataVersionOrOptions?: string | CacheOptions
 ): void {
-  const options = normalizeOptions(dataVersionOrOptions);
+  const options = normalizeOptions(dataVersionOrOptions, key);
   const dataSize = estimateSize(data);
   const sizeBytes = dataSize + key.length * 2 + 128; // approx 128 bytes metadata overhead
 
@@ -456,7 +563,11 @@ export function setCache<T>(
     tags: options.tags,
     dataType: options.dataType,
     critical: options.critical,
+    persist: options.persist,
+    sensitive: options.sensitive,
+    encrypted: options.encrypted,
     sizeBytes,
+    lastAccessedAt: Date.now(),
   };
 
   putMemoryEntry(key, entry);
@@ -488,6 +599,19 @@ export function invalidateByPattern(pattern: RegExp): number {
 
   void invalidatePersistentWhere(key => pattern.test(key));
   return removed;
+}
+
+/**
+ * Invalidate every cache entry whose key matches `urlPattern` (Issue #597).
+ *
+ * Public alias of {@link invalidateByPattern}, used by the axios response
+ * interceptor to drop related GET caches immediately after a successful
+ * mutation so critical data (e.g. subscription status) is never served stale.
+ *
+ * @returns the number of entries removed.
+ */
+export function invalidatePattern(urlPattern: RegExp): number {
+  return invalidateByPattern(urlPattern);
 }
 
 export function invalidateCacheByPrefix(prefix: string): number {
@@ -677,7 +801,7 @@ export async function fetchWithSWR<T>(
   staleTtl = 300_000,
   options?: string | CacheOptions
 ): Promise<T> {
-  const normalizedOptions = normalizeOptions(options);
+  const normalizedOptions = normalizeOptions(options, key);
   const memoryEntry = getMemoryEntry<T>(key);
 
   if (memoryEntry !== null) {

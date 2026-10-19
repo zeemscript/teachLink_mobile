@@ -1,5 +1,6 @@
 import * as Device from 'expo-device';
 import { Platform, LayoutAnimation as RNLayoutAnimation, UIManager, LayoutAnimationConfig } from 'react-native';
+import { appLogger } from './logger';
 
 /**
  * Centralized LayoutAnimation utility with device capability detection
@@ -128,7 +129,7 @@ export function getOptimizedPreset(): LayoutAnimationConfig {
 // Debouncing to Prevent Layout Thrashing
 // ─────────────────────────────────────────────────────────────────────
 
-let animationTimeout: NodeJS.Timeout | null = null;
+let animationTimeout: ReturnType<typeof setTimeout> | null = null;
 const ANIMATION_DEBOUNCE_MS = 100;
 
 /**
@@ -157,7 +158,7 @@ export function configureNext(config?: LayoutAnimationConfig): void {
     try {
       RNLayoutAnimation.configureNext(animationConfig);
     } catch (error) {
-      console.warn('[LayoutAnimation] Failed to configure next animation:', error);
+      appLogger.warnSync('[LayoutAnimation] Failed to configure next animation:', error);
     } finally {
       animationTimeout = null;
     }
@@ -182,7 +183,7 @@ export function configureNextImmediate(config?: LayoutAnimationConfig): void {
   try {
     RNLayoutAnimation.configureNext(animationConfig);
   } catch (error) {
-    console.warn('[LayoutAnimation] Failed to configure immediate animation:', error);
+    appLogger.warnSync('[LayoutAnimation] Failed to configure immediate animation:', error);
   }
 }
 
@@ -216,7 +217,7 @@ export function initializeLayoutAnimation(): void {
       UIManager.setLayoutAnimationEnabledExperimental(true);
       isInitialized = true;
     } catch (error) {
-      console.warn('[LayoutAnimation] Failed to enable experimental LayoutAnimation:', error);
+      appLogger.warnSync('[LayoutAnimation] Failed to enable experimental LayoutAnimation:', error);
     }
   } else if (Platform.OS === 'ios') {
     // iOS has LayoutAnimation enabled by default

@@ -16,10 +16,12 @@ import BookmarkButton from './BookmarkButton';
 import { CourseViewerSkeleton } from './CourseViewerSkeleton';
 import LessonCarousel from './LessonCarousel';
 import MobileSyllabus from './MobileSyllabus';
+import { LazyMobileVideoPlayer } from '../../utils/lazyComponents';
 import { useCourseProgress, useDynamicFontSize } from '../../hooks';
 import { useAnalytics } from '../../hooks/useAnalytics';
 import { useInAppReview, useReviewMetrics } from '../../hooks/useInAppReview';
 import { usePrefetchImages } from '../../hooks/usePrefetchImages';
+import certificateService from '../../services/certificateService';
 import { ReviewTrigger } from '../../services/inAppReview';
 import { useReviewStore } from '../../store/reviewStore';
 import { Course, Lesson, Note } from '../../types/course';
@@ -28,6 +30,9 @@ import { AnalyticsEvent, ScreenName } from '../../utils/trackingEvents';
 import { AppText as Text } from '../common/AppText';
 import { ErrorBoundary } from '../common/ErrorBoundary';
 import PrimaryButton from '../common/PrimaryButton';
+
+const INITIAL_VISIBLE_LESSONS = 3;
+const LAZY_LOAD_BATCH = 5;
 
 /**
  * Props for the MobileCourseViewer component
@@ -69,6 +74,16 @@ const MobileCourseViewer = ({
   const [editingNote, setEditingNote] = useState<Note | null>(null);
   const [showQuizPromptModal, setShowQuizPromptModal] = useState(false);
 
+  // Lazy-load state: only first N lessons are visible initially
+  const totalLessons = useMemo(
+    () => course.sections.reduce((sum, s) => sum + s.lessons.length, 0),
+    [course.sections]
+  );
+  const [loadedLessonCount, setLoadedLessonCount] = useState(
+    Math.min(INITIAL_VISIBLE_LESSONS, totalLessons)
+  );
+  const [lazyLoading, setLazyLoading] = useState(false);
+
   const {
     progress,
     isLoading,
@@ -102,7 +117,54 @@ const MobileCourseViewer = ({
   }, [isLoading, fadeAnim]);
 
   // Get all lessons in order
-  const allLessons = course.sections.flatMap(section => section.lessons.map(lesson => lesson));
+  const allLessons = useMemo(
+    () => course.sections.flatMap(section => section.lessons.map(lesson => lesson)),
+    [course.sections]
+  );
+
+  // Build a set of loaded lesson IDs for quick lookup
+  const loadedLessonIds = useMemo(
+    () => new Set(allLessons.slice(0, loadedLessonCount).map(l => l.id)),
+    [allLessons, loadedLessonCount]
+  );
+
+  // Filter sections to only include loaded lessons
+  const visibleSections = useMemo(
+    () =>
+      course.sections
+        .map(section => ({
+          ...section,
+          lessons: section.lessons.filter(lesson => loadedLessonIds.has(lesson.id)),
+        }))
+        .filter(section => section.lessons.length > 0),
+    [course.sections, loadedLessonIds]
+  );
+
+  const visibleLessons = useMemo(
+    () => visibleSections.flatMap(section => section.lessons),
+    [visibleSections]
+  );
+
+  // Load more lessons when user scrolls near the bottom of the syllabus
+  const loadMoreLessons = useCallback(() => {
+    if (lazyLoading || loadedLessonCount >= totalLessons) return;
+    setLazyLoading(true);
+    requestAnimationFrame(() => {
+      setLoadedLessonCount(prev => Math.min(prev + LAZY_LOAD_BATCH, totalLessons));
+      setLazyLoading(false);
+    });
+  }, [lazyLoading, loadedLessonCount, totalLessons]);
+
+  const handleSyllabusScroll = useCallback(
+    (event: { nativeEvent: { contentOffset: { y: number }; contentSize: { height: number }; layoutMeasurement: { height: number } } }) => {
+      const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+      const distanceFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
+      if (distanceFromBottom < 200 && loadedLessonCount < totalLessons && !lazyLoading) {
+        loadMoreLessons();
+      }
+    },
+    [loadedLessonCount, totalLessons, lazyLoading, loadMoreLessons]
+  );
 
   // Helper to get section ID for a lesson
   const getSectionIdForLesson = useCallback(
@@ -117,7 +179,7 @@ const MobileCourseViewer = ({
     [course]
   );
 
-  const currentLesson = allLessons.find(l => l.id === currentLessonId);
+  const currentLesson = visibleLessons.find(l => l.id === currentLessonId);
   const isBookmarked = progress?.bookmarks.includes(currentLessonId) || false;
 
   // Check if current lesson is last in its section
@@ -185,6 +247,9 @@ const MobileCourseViewer = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [course.id]);
 
+  // #833: ensure a certificate is only requested once per completion.
+  const certificateRequestedRef = useRef(false);
+
   // Track course completion
   useEffect(() => {
     if (progress) {
@@ -195,6 +260,12 @@ const MobileCourseViewer = ({
           courseTitle: course.title,
           progress: overallProgress,
         });
+
+        // #833: generate the certificate of completion for the finished course.
+        if (!certificateRequestedRef.current) {
+          certificateRequestedRef.current = true;
+          void certificateService.generateCertificate(course.id, course.title);
+        }
 
         // Track and request review
         trackCourseComplete();
@@ -331,6 +402,12 @@ const MobileCourseViewer = ({
     setViewMode('syllabus');
   }, []);
 
+  const handleVideoEnd = useCallback(async () => {
+    if (!currentLessonId) return;
+    await markLessonComplete(currentLessonId);
+    Alert.alert('Lesson Completed', 'This lesson has been marked as complete.');
+  }, [currentLessonId, markLessonComplete]);
+
   const renderLessonContent = useCallback(
     (lesson: Lesson) => {
       const lessonNotes = progress?.notes[lesson.id] || [];
@@ -342,6 +419,17 @@ const MobileCourseViewer = ({
             showsVerticalScrollIndicator={false}
             removeClippedSubviews={true}
           >
+            {/* Video Player */}
+            {lesson.videoUrl ? (
+              <View style={{ marginBottom: 16 }}>
+                <LazyMobileVideoPlayer
+                  sources={[{ uri: lesson.videoUrl, quality: 'auto', id: lesson.id }]}
+                  autoPlay={false}
+                  onEnd={handleVideoEnd}
+                />
+              </View>
+            ) : null}
+
             {/* Lesson Content */}
             <View style={styles.lessonSection}>
               <Text style={styles.lessonText}>{lesson.content}</Text>
@@ -350,9 +438,9 @@ const MobileCourseViewer = ({
             {/* Resources */}
             {lesson.resources && lesson.resources.length > 0 && (
               <View style={styles.resourcesSection}>
-                <Text style={styles.sectionTitle}>📚 Resources</Text>
+                <Text style={styles.sectionTitle}>Resources</Text>
                 {lesson.resources.map(resource => (
-                  <TouchableOpacity key={resource.id} style={styles.resourceItem}>
+                  <TouchableOpacity key={resource.id} style={styles.resourceItem} accessibilityRole="link" accessibilityLabel={`Resource: ${resource.title}`}>
                     <Text style={styles.resourceTitle}>{resource.title}</Text>
                     <Text style={styles.resourceType}>{resource.type.toUpperCase()}</Text>
                   </TouchableOpacity>
@@ -362,7 +450,7 @@ const MobileCourseViewer = ({
 
             {/* Notes Section */}
             <View style={styles.notesSection}>
-              <Text style={styles.sectionTitle}>📝 Your Notes</Text>
+              <Text style={styles.sectionTitle}>Your Notes</Text>
 
               {lessonNotes.length === 0 ? (
                 <View style={styles.emptyNotesContainer}>
@@ -380,10 +468,10 @@ const MobileCourseViewer = ({
                           {new Date(note.createdAt).toLocaleTimeString()}
                         </Text>
                         <View style={styles.noteActions}>
-                          <TouchableOpacity onPress={() => handleEditNote(note)}>
+                          <TouchableOpacity onPress={() => handleEditNote(note)} accessibilityRole="button" accessibilityLabel="Edit note">
                             <Text style={styles.editNoteButton}>Edit</Text>
                           </TouchableOpacity>
-                          <TouchableOpacity onPress={() => handleDeleteNote(note)}>
+                          <TouchableOpacity onPress={() => handleDeleteNote(note)} accessibilityRole="button" accessibilityLabel="Delete note">
                             <Text style={styles.deleteNoteButton}>Delete</Text>
                           </TouchableOpacity>
                         </View>
@@ -399,7 +487,7 @@ const MobileCourseViewer = ({
       );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [progress, handleAddNote, handleEditNote, handleDeleteNote]
+    [progress, handleAddNote, handleEditNote, handleDeleteNote, handleVideoEnd]
   );
 
   if (isLoading) {
@@ -415,7 +503,7 @@ const MobileCourseViewer = ({
         <View style={styles.header}>
         <View style={styles.headerContent}>
           {onBack && (
-            <TouchableOpacity onPress={onBack} style={styles.backButton}>
+            <TouchableOpacity onPress={onBack} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Go back to course list">
               <Text style={styles.backButtonText}>←</Text>
             </TouchableOpacity>
           )}
@@ -443,6 +531,9 @@ const MobileCourseViewer = ({
       <View style={styles.tabContainer}>
         <TouchableOpacity
           onPress={() => setViewMode('lesson')}
+          accessibilityRole="tab"
+          accessibilityLabel="Lesson tab"
+          accessibilityState={{ selected: viewMode === 'lesson' }}
           style={[
             styles.tab,
             { borderBottomColor: viewMode === 'lesson' ? '#20afe7' : 'transparent' },
@@ -462,6 +553,9 @@ const MobileCourseViewer = ({
         </TouchableOpacity>
         <TouchableOpacity
           onPress={() => setViewMode('syllabus')}
+          accessibilityRole="tab"
+          accessibilityLabel="Syllabus tab"
+          accessibilityState={{ selected: viewMode === 'syllabus' }}
           style={[
             styles.tab,
             { borderBottomColor: viewMode === 'syllabus' ? '#20afe7' : 'transparent' },
@@ -485,7 +579,7 @@ const MobileCourseViewer = ({
       {viewMode === 'lesson' && currentLesson && (
         <View style={styles.contentContainer}>
           <LessonCarousel
-            lessons={allLessons}
+            lessons={visibleLessons}
             currentLessonId={currentLessonId}
             progress={progress}
             onLessonChange={handleLessonChange}
@@ -500,7 +594,7 @@ const MobileCourseViewer = ({
             <View style={styles.buttonWrapper}>
               <PrimaryButton
                 onPress={handleAddNote}
-                title="📝 Add Note"
+                title="Add Note"
                 variant="solid"
                 size="medium"
               />
@@ -508,7 +602,7 @@ const MobileCourseViewer = ({
             <View style={styles.buttonWrapper}>
               <PrimaryButton
                 onPress={handleCompleteLesson}
-                title="✓ Complete"
+                title="Complete"
                 variant="gradient"
                 size="medium"
               />
@@ -519,10 +613,11 @@ const MobileCourseViewer = ({
 
       {viewMode === 'syllabus' && (
         <MobileSyllabus
-          sections={course.sections}
+          sections={visibleSections}
           progress={progress}
           currentLessonId={currentLessonId}
           onLessonSelect={handleLessonSelect}
+          onSyllabusScroll={handleSyllabusScroll}
         />
       )}
 
@@ -537,8 +632,8 @@ const MobileCourseViewer = ({
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Section Complete! 🎉</Text>
-                <TouchableOpacity onPress={handleSkipQuiz}>
+                <Text style={styles.modalTitle}>Section Complete!</Text>
+                <TouchableOpacity onPress={handleSkipQuiz} accessibilityRole="button" accessibilityLabel="Close quiz prompt">
                   <Text style={styles.closeButton}>×</Text>
                 </TouchableOpacity>
               </View>
@@ -558,7 +653,7 @@ const MobileCourseViewer = ({
               )}
 
               <View style={styles.modalButtonContainer}>
-                <TouchableOpacity onPress={handleSkipQuiz} style={styles.cancelButton}>
+                <TouchableOpacity onPress={handleSkipQuiz} style={styles.cancelButton} accessibilityRole="button" accessibilityLabel="Skip quiz for now">
                   <Text style={styles.cancelButtonText}>Skip for Now</Text>
                 </TouchableOpacity>
                 <View style={{ flex: 1, marginLeft: 12 }}>
@@ -593,6 +688,8 @@ const MobileCourseViewer = ({
                     setNoteContent('');
                     setEditingNote(null);
                   }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close note modal"
                 >
                   <Text style={styles.closeButton}>×</Text>
                 </TouchableOpacity>
@@ -616,6 +713,8 @@ const MobileCourseViewer = ({
                     setEditingNote(null);
                   }}
                   style={styles.cancelButton}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cancel note"
                 >
                   <Text style={styles.cancelButtonText}>Cancel</Text>
                 </TouchableOpacity>

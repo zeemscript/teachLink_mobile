@@ -1,9 +1,7 @@
 import apiClient from './axios.config';
 import { fetchWithSWR } from './cache';
 import { requestDeduplicator } from './requestDeduplicator';
-
-const DEFAULT_TTL_MS = 60_000;
-const DEFAULT_STALE_TTL_MS = 5 * 60_000;
+import { resolveEndpointTtl } from '../../config/apiCacheConfig';
 
 function buildRequestCacheKey(url: string, params?: unknown): string {
   const serializedParams = params == null ? '' : JSON.stringify(params);
@@ -23,23 +21,29 @@ export const apiService = {
    */
   get: <T = unknown>(url: string, params?: any) => {
     const cacheKey = buildRequestCacheKey(url, params);
+    // Issue #597 — resolve the per-endpoint TTL (critical vs static), falling
+    // back to the global default for unconfigured endpoints.
+    const { ttl, staleTtl } = resolveEndpointTtl(url);
     return requestDeduplicator.deduplicate<T>({ method: 'GET', url, params }, () =>
       fetchWithSWR<T>(
         cacheKey,
         () => apiClient.get<T>(url, { params }).then(response => response.data as T),
-        DEFAULT_TTL_MS,
-        DEFAULT_STALE_TTL_MS,
+        ttl,
+        staleTtl,
         {
           dataType: 'api-read',
           tags: [buildResourceTag(url)],
-          critical: false,
+          critical: ttl <= 30_000,
+          persist: resolveEndpointTtl(url).persistable,
         }
       )
     );
   },
-  post: (url: string, data: any) => apiClient.post(url, data),
-  put: (url: string, data: any) => apiClient.put(url, data),
-  delete: (url: string) => apiClient.delete(url),
+  /** #801: Generic response type so callers can infer the response shape. */
+  post: <T = unknown>(url: string, data: unknown) => apiClient.post<T>(url, data),
+  put: <T = unknown>(url: string, data: unknown) => apiClient.put<T>(url, data),
+  patch: <T = unknown>(url: string, data: unknown) => apiClient.patch<T>(url, data),
+  delete: <T = unknown>(url: string) => apiClient.delete<T>(url),
 };
 
 export { default as apiClient } from './axios.config';
@@ -52,12 +56,20 @@ export {
   getCacheStatus,
   getRevalidatingCacheKeys,
   invalidateCache,
+  invalidateByPattern,
   invalidateCacheByPrefix,
   invalidateCacheByTags,
   invalidateCacheForBatchRequests,
   invalidateCacheForMutation,
+  invalidatePattern,
   resetCacheStats,
 } from './cache';
+export {
+  DEFAULT_ENDPOINT_TTL,
+  ENDPOINT_TTL_MAP,
+  resolveEndpointPersistence,
+  resolveEndpointTtl,
+} from '../../config/apiCacheConfig';
 export { courseApi } from './courseApi';
 export {
   buildCursor,

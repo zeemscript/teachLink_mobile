@@ -1,8 +1,10 @@
+import { CourseSchema } from '../../types/api/schemas';
+import { Course } from '../../types/course';
 import apiClient from './axios.config';
 import { batchClient } from './batchClient';
 import { fetchWithSWR, invalidateCacheByTags } from './cache';
 import { buildCursorCacheKey, CursorPageRequest, CursorPageResponse } from './cursorPagination';
-import { Course } from '../../types/course';
+import { validateResponse } from './validation';
 
 const COURSES_KEY = 'courses:list';
 const courseKey = (id: string) => `courses:${id}`;
@@ -14,19 +16,20 @@ const TTL = 2 * 60_000;
 const STALE_TTL = 10 * 60_000;
 
 export const courseApi = {
-  getCourses(): Promise<Course[]> {
-    return fetchWithSWR(COURSES_KEY, () => batchClient.get('/courses'), TTL, STALE_TTL, {
+  async getCourses(): Promise<Course[]> {
+    const response = await fetchWithSWR(COURSES_KEY, () => batchClient.get('/courses'), TTL, STALE_TTL, {
       dataType: 'course-list',
       tags: [COURSE_TAG],
       critical: true,
     });
+    return validateResponse(CourseSchema.array(), response, { api: 'getCourses' });
   },
 
-  getCoursesPage(request: CursorPageRequest = {}): Promise<CursorPageResponse<Course>> {
+  async getCoursesPage(request: CursorPageRequest = {}): Promise<CursorPageResponse<Course>> {
     const { limit = 20, cursor, orderBy = 'id', direction = 'asc' } = request;
     const cacheKey = `courses:${buildCursorCacheKey({ limit, cursor, orderBy, direction })}`;
 
-    return fetchWithSWR(
+    const response = await fetchWithSWR(
       cacheKey,
       () =>
         apiClient
@@ -42,13 +45,25 @@ export const courseApi = {
         critical: true,
       }
     );
+    return validateResponse(CourseSchema.extend({ data: CourseSchema.array() }), response, { api: 'getCoursesPage' });
   },
 
-  getCourse(id: string): Promise<Course> {
-    return fetchWithSWR(courseKey(id), () => batchClient.get(`/courses/${id}`), TTL, STALE_TTL, {
-      dataType: 'course-detail',
-      tags: [COURSE_TAG, courseTag(id)],
-    });
+  /** Fetch a single course by ID (batched, cached with SWR).
+   *  Pass `include` to embed related resources (e.g. `'lessons'`) in the response. */
+  async getCourse(id: string, include?: string): Promise<Course> {
+    const params = include ? { include } : undefined;
+    const cacheKey = params ? `${courseKey(id)}:${JSON.stringify(params)}` : courseKey(id);
+    const response = await fetchWithSWR(
+      cacheKey,
+      () => batchClient.get(`/courses/${id}`, params),
+      TTL,
+      STALE_TTL,
+      {
+        dataType: 'course-detail',
+        tags: [COURSE_TAG, courseTag(id)],
+      }
+    );
+    return validateResponse(CourseSchema, response, { api: 'getCourse', id });
   },
 
   invalidateCourses(): void {
@@ -57,5 +72,40 @@ export const courseApi = {
 
   invalidateCourse(id: string): void {
     invalidateCacheByTags([COURSE_TAG, courseTag(id)]);
+  },
+
+  /**
+   * loadLessonsPage — fetch a paginated slice of lesson metadata for a course.
+   *
+   * Used by the windowed loading implementation in courseProgressStore to avoid
+   * loading all 50+ lessons into memory at once. Only metadata (IDs, titles,
+   * durations, video URLs) is fetched; heavy content is loaded on demand.
+   *
+   * @param courseId  - Course to paginate lessons for.
+   * @param page      - 1-based page number.
+   * @param limit     - Lessons per page (default 5 — current ± 2 window).
+   */
+  async loadLessonsPage(
+    courseId: string,
+    page: number,
+    limit = 5
+  ): Promise<{ lessons: import('../../types/course').Lesson[]; totalLessons: number; page: number; totalPages: number }> {
+    const cacheKey = `courses:${courseId}:lessons:page=${page}:limit=${limit}`;
+    return fetchWithSWR(
+      cacheKey,
+      () =>
+        apiClient
+          .get<{ lessons: import('../../types/course').Lesson[]; totalLessons: number; page: number; totalPages: number }>(
+            `/courses/${courseId}/lessons`,
+            { params: { page, limit } }
+          )
+          .then(r => r.data),
+      TTL,
+      STALE_TTL,
+      {
+        dataType: 'lesson-page',
+        tags: [COURSE_TAG, courseTag(courseId)],
+      }
+    );
   },
 };

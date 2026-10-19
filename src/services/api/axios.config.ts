@@ -11,27 +11,54 @@
  */
 
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
+import * as Crypto from 'expo-crypto';
 
 import {
+  invalidateByPattern,
   invalidateCacheForBatchRequests,
   invalidateCacheForMutation,
-  invalidateByPattern,
+  getCacheStats,
 } from './cache';
+import { buildSanitizedApiError } from './errorSanitization';
 import { requestQueue } from './requestQueue';
 import { getEnv } from '../../config';
 import { MUTATION_INVALIDATION_MAP } from '../../config/apiCacheConfig';
+import { pushLogContext, popLogContext } from '../../config/logging';
 import { SSL_PINNING } from '../../config/security';
 import { useAppStore } from '../../store';
-import { useConflictStore, type ConflictData } from '../../store/conflictStore';
+import { useConflictStore } from '../../store/conflictStore';
 import { appLogger } from '../../utils/logger';
-import { startTiming, notifyEntry } from '../../utils/performanceTiming';
+import { notifyEntry, startTiming } from '../../utils/performanceTiming';
 import { healthMetricsService } from '../healthMetrics';
 import { getAccessToken, getRefreshToken, saveTokens } from '../secureStorage';
 import { sentryContextService } from '../sentryContext';
+import {
+  isConflictResponseShape,
+  buildConflictDataFromHttpError,
+} from '../sync/httpConflictDetection';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Parses a Retry-After header value (seconds or HTTP-date) into milliseconds.
+ * Returns undefined if the value cannot be parsed.
+ */
+function parseRetryAfterMs(retryAfter: unknown): number | undefined {
+  if (typeof retryAfter !== 'string') return undefined;
+  const trimmed = retryAfter.trim();
+  const asNumber = Number(trimmed);
+  if (!Number.isNaN(asNumber) && asNumber >= 0) {
+    return Math.floor(asNumber * 1000);
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (!Number.isNaN(parsedDate)) {
+    const ms = parsedDate - Date.now();
+    return ms > 0 ? Math.floor(ms) : undefined;
+  }
+  return undefined;
+}
 
 /**
  * Returns true when a network-layer error is consistent with an SSL certificate
@@ -70,6 +97,8 @@ function isCertPinFailure(error: AxiosError): boolean {
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 60_000;
 const MAX_SERVER_ERROR_RETRIES = 7;
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
+const RETRY_DEADLINE_MS = 30_000; // Overall deadline for all retries
 
 function getBackoffWithJitter(attempt: number): number {
   const exponential = BASE_DELAY_MS * Math.pow(2, attempt);
@@ -92,17 +121,59 @@ function invalidateSuccessfulMutationCache(config: InternalAxiosRequestConfig): 
     return;
   }
 
-  // Pattern-based invalidation from config map
-  for (const rule of MUTATION_INVALIDATION_MAP) {
-    if (rule.methods.includes(method) && rule.urlPattern.test(url)) {
-      for (const pattern of rule.invalidatePatterns) {
-        invalidateByPattern(pattern);
+  // Pattern-based invalidation from config map — O(1) method lookup
+  const rules = MUTATION_INVALIDATION_MAP.get(method);
+  if (rules) {
+    for (const rule of rules) {
+      if (rule.urlPattern.test(url)) {
+        for (const pattern of rule.invalidatePatterns) {
+          invalidateByPattern(pattern);
+        }
+        return;
       }
-      return;
     }
   }
 
   invalidateCacheForMutation(method, url);
+}
+
+// ─── Batched cache statistics (#811) ──────────────────────────────────────────
+//
+// Cache.ts maintains the authoritative hit/miss counters via recordHit/recordMiss.
+// This module reads those counters on a 60-second interval and logs a summary,
+// avoiding duplicate counter implementations.
+
+const CACHE_STATS_INTERVAL_MS = 60_000;
+
+function flushCacheStats(): void {
+  const stats = getCacheStats();
+  const { hits, misses } = stats;
+  const total = hits + misses;
+  if (total === 0) return;
+  const hitRate = ((hits / total) * 100).toFixed(1);
+  appLogger.infoSync(
+    `[CacheStats] ${hitRate}% hit rate over last 60 s (${hits}/${total} requests served from cache)`,
+    { cacheHits: hits, cacheMisses: misses, hitRatePct: parseFloat(hitRate) }
+  );
+}
+
+/** Flush immediately (e.g. on app background). */
+export const flushCacheStatsNow = flushCacheStats;
+
+let _cacheStatsInterval: ReturnType<typeof setInterval> | null = null;
+
+/** Start the periodic cache-stats flush interval. Idempotent. */
+export function startCacheStatsFlush(): void {
+  if (_cacheStatsInterval !== null) return;
+  _cacheStatsInterval = setInterval(flushCacheStats, CACHE_STATS_INTERVAL_MS);
+}
+
+/** Stop the periodic cache-stats flush interval and flush remaining stats. */
+export function stopCacheStatsFlush(): void {
+  if (_cacheStatsInterval === null) return;
+  clearInterval(_cacheStatsInterval);
+  _cacheStatsInterval = null;
+  flushCacheStats();
 }
 
 // ─── Rate Limit Backoff (Issue #141) ──────────────────────────────────────
@@ -129,30 +200,97 @@ const apiClient = axios.create({
 
 export const UPLOAD_TIMEOUT_MS = 30_000;
 
-// ─── Refresh queue ─────────────────────────────────────────────────────────
+// ─── Refresh queue (Issue #673 — race condition deduplication) ─────────────────
+// When multiple concurrent 401 responses arrive simultaneously, only the first
+// triggers a token refresh. Subsequent callers await the same in-flight promise
+// via this queue, preventing double-refresh that would invalidate the session.
 
 let isRefreshing = false;
+let refreshStartTime = 0;
+
+const MAX_QUEUE_SIZE = 50;
 
 let refreshQueue: {
   resolve: (token: string) => void;
   reject: (err: unknown) => void;
 }[] = [];
 
+export function clearRefreshQueue(error?: Error) {
+  const err = error || new Error('Session cleared during token refresh.');
+  processRefreshQueue(null, err);
+}
+
 function processRefreshQueue(token: string | null, error: unknown) {
   refreshQueue.forEach(({ resolve, reject }) => (token ? resolve(token) : reject(error)));
   refreshQueue = [];
+}
+
+// ─── Session accessor (injected by store bootstrap) ────────────────────────
+// The API layer should not depend on the store.  A module-level accessor is
+// set once during app init; the request interceptor delegates to it.
+
+interface SessionAccessor {
+  isAuthenticated: boolean;
+  sessionExpiresAt: number | null;
+  logout: () => void;
+}
+
+let _getSession: (() => SessionAccessor) | null = null;
+
+export function setSessionAccessor(accessor: () => SessionAccessor): void {
+  _getSession = accessor;
+}
+
+// ─── Request ID generation ──────────────────────────────────────────────────
+// One native crypto call per session; derive per-request IDs from a counter.
+
+let _sessionRequestId = '';
+let _requestCounter = 0;
+
+function initSessionRequestId(): void {
+  _sessionRequestId = Crypto.randomUUID();
+  _requestCounter = 0;
+}
+
+function nextRequestId(): string {
+  if (!_sessionRequestId) initSessionRequestId();
+  return `${_sessionRequestId}-${++_requestCounter}`;
 }
 
 // ─── Request interceptor ───────────────────────────────────────────────────
 
 apiClient.interceptors.request.use(
   async (config: InternalAxiosRequestConfig & { _requestStartMs?: number }) => {
+    const requestId = nextRequestId();
+    config.headers['X-Request-ID'] = requestId;
+    pushLogContext({ requestId });
+
     // Stamp request start time for latency tracking
     config._requestStartMs = Date.now();
 
     // Skip adding token for refresh requests
     if (config.url?.includes('/auth/refresh')) {
       return config;
+    }
+
+    // Generate Idempotency-Key for POST requests to prevent duplicate writes on retry
+    if (config.method?.toUpperCase() === 'POST' && !config.headers?.['Idempotency-Key']) {
+      config.headers['Idempotency-Key'] = Crypto.randomUUID();
+    }
+
+    // Hard-block any authenticated request when the session has already expired.
+    // The foreground check in App.tsx handles proactive refresh; this is the
+    // safety net for requests that slip through while the app is in use.
+    if (_getSession) {
+      const { isAuthenticated, sessionExpiresAt, logout } = _getSession();
+      if (isAuthenticated && sessionExpiresAt !== null && Date.now() >= sessionExpiresAt) {
+        logout();
+        return Promise.reject({
+          message: 'Session expired. Please log in again.',
+          code: 'SESSION_EXPIRED',
+          status: 401,
+        });
+      }
     }
 
     const token = await getAccessToken();
@@ -162,9 +300,15 @@ apiClient.interceptors.request.use(
     }
 
     // Attach timing finish function to config for use in response interceptor
-    (
-      config as InternalAxiosRequestConfig & { _timingFinish?: ReturnType<typeof startTiming> }
-    )._timingFinish = startTiming('api', config.url ?? 'unknown', config.method?.toUpperCase());
+    // Only call startTiming when _timingFinish is not already set to avoid
+    // leaking finalisers on retried requests.
+    if (!config._timingFinish) {
+      config._timingFinish = startTiming(
+        'api',
+        config.url ?? 'unknown',
+        config.method?.toUpperCase()
+      );
+    }
 
     return config;
   },
@@ -172,21 +316,31 @@ apiClient.interceptors.request.use(
 );
 
 // ─── Image format request interceptor ──────────────────────────────────────
-// Negotiate WebP format via Accept header for image-serving API endpoints.
+// Short-circuit: cheap substring check before any regex evaluation.
+// Only matches image-serving endpoints; folded into the main interceptor.
 
-const IMAGE_PATH_PATTERNS = [
-  /\/images?\//,
-  /\/uploads?\//,
-  /\/avatars?\//,
-  /\/media\//,
-  /\.(png|jpg|jpeg|gif|webp|avif)/i,
+const IMAGE_ACCEPT_HEADER = 'image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8';
+
+const IMAGE_PATH_PREFIXES = [
+  '/images',
+  '/image',
+  '/uploads',
+  '/upload',
+  '/avatars',
+  '/avatar',
+  '/media',
 ];
+
+function looksLikeImageUrl(url: string): boolean {
+  if (!IMAGE_PATH_PREFIXES.some(p => url.includes(p))) return false;
+  return /\.(png|jpg|jpeg|gif|webp|avif)(\?|$)/i.test(url);
+}
 
 apiClient.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
     const url = config.url ?? '';
-    if (IMAGE_PATH_PATTERNS.some(pattern => pattern.test(url))) {
-      config.headers.Accept = 'image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8';
+    if (looksLikeImageUrl(url)) {
+      config.headers.Accept = IMAGE_ACCEPT_HEADER;
     }
     return config;
   },
@@ -197,8 +351,23 @@ apiClient.interceptors.request.use(
 
 apiClient.interceptors.response.use(
   response => {
+    const sentRequestId = response.config.headers['X-Request-ID'];
+    const receivedRequestId = response.headers['x-request-id'];
+
+    if (sentRequestId && receivedRequestId && sentRequestId !== receivedRequestId) {
+      appLogger.warnSync('Request ID mismatch', {
+        sent: sentRequestId,
+        received: receivedRequestId,
+      });
+    }
+
+    popLogContext();
+
     // Record successful API call for health metrics
-    const cfg = response.config as InternalAxiosRequestConfig & { _requestStartMs?: number };
+    const cfg = response.config as InternalAxiosRequestConfig & {
+      _requestStartMs?: number;
+      _timingFinish?: ReturnType<typeof startTiming>;
+    };
     const durationMs = cfg._requestStartMs ? Date.now() - cfg._requestStartMs : 0;
     healthMetricsService.recordApiCall({
       endpoint: cfg.url ?? 'unknown',
@@ -207,13 +376,33 @@ apiClient.interceptors.response.use(
       statusCode: response.status,
     });
     invalidateSuccessfulMutationCache(cfg);
+
+    // Record timing on success — exactly once per logical request
+    if (cfg._timingFinish) {
+      const entry = cfg._timingFinish(true, response.status);
+      entry.retryCount = cfg._retryCount ?? 0;
+      notifyEntry(entry);
+      cfg._timingFinish = undefined;
+    }
+
+    // Successful login resets the client-side auth-failure counter.
+    // This is a UX affordance only; the actual security boundary is server-side
+    // rate limiting on /auth/login (per account and per IP).
+    if (cfg.url?.includes('/auth/login')) {
+      useAppStore.getState().resetAuthFailures();
+    }
+
     return response;
   },
   async (error: AxiosError) => {
+    popLogContext();
+
     const originalRequest = error.config as InternalAxiosRequestConfig & {
       _retry?: boolean;
       _retryCount?: number;
+      _retryDeadlineAt?: number;
       _requestStartMs?: number;
+      _timingFinish?: ReturnType<typeof startTiming>;
     };
 
     // ── Record API error for health metrics ───────────────────────────────
@@ -263,36 +452,62 @@ apiClient.interceptors.response.use(
       (error.code === 'ERR_NETWORK' || error.message === 'Network Error') &&
       isCertPinFailure(error)
     ) {
+      const requestUrl = originalRequest?.url ?? '';
+      const authApiDomain = new URL(baseURL).hostname;
+      const requestDomain = requestUrl ? new URL(requestUrl, baseURL).hostname : '';
       // Report to Sentry — endpoint and method only; no token, headers, or body
       sentryContextService.captureException(new Error('SSL certificate pin validation failed'), {
         tags: { 'security.event': 'ssl_pin_failure' },
         extra: {
           endpoint: originalRequest?.url,
           method: originalRequest?.method?.toUpperCase(),
+          isAuthDomain: requestDomain === authApiDomain,
         },
-        fingerprint: ['ssl-pin-failure'],
+        fingerprint: ['ssl-pin-failure', requestDomain],
       });
 
       appLogger.errorSync('SSL pin validation failed — possible MITM attack', undefined, {
         endpoint: originalRequest?.url,
         method: originalRequest?.method,
+        isAuthDomain: requestDomain === authApiDomain,
       });
 
-      // Force full logout — session may be compromised
-      useAppStore.getState().logout();
+      if (requestDomain === authApiDomain) {
+        // Force full logout — session may be compromised
+        useAppStore.getState().logout();
 
-      return Promise.reject({
-        message:
-          'Secure connection could not be established. Please check your network and try again.',
-        code: 'SSL_PIN_FAILURE',
-        status: 0,
-      });
+        return Promise.reject({
+          message: 'A security error occurred. Please log in again.',
+          code: 'SSL_PIN_FAILURE',
+        });
+      } else {
+        // For non-auth domains, cancel the request and show a security warning
+        return Promise.reject({
+          message: 'A security error occurred with a third-party service. Please try again later.',
+          code: 'SSL_PIN_FAILURE_NON_AUTH',
+        });
+      }
     }
 
     // ── Queue network errors for retry ───────────────────────────────────
     if (error.code === 'ERR_NETWORK' || error.message === 'Network Error') {
       if (originalRequest) {
-        await requestQueue.addToQueue(originalRequest);
+        const method = originalRequest.method?.toUpperCase();
+        const isIdempotent = method === undefined || IDEMPOTENT_METHODS.has(method);
+        const hasIdempotencyKey = Boolean(originalRequest.headers?.['Idempotency-Key']);
+
+        // Only queue idempotent methods or mutations with an idempotency key
+        if (isIdempotent || hasIdempotencyKey) {
+          await requestQueue.addToQueue(originalRequest);
+        } else {
+          appLogger.warnSync(
+            'Network error on non-idempotent request — not queueing to prevent duplicate writes',
+            {
+              endpoint: originalRequest.url,
+              method: originalRequest.method,
+            }
+          );
+        }
       }
       return Promise.reject(error);
     }
@@ -300,6 +515,14 @@ apiClient.interceptors.response.use(
     const status = error.response?.status;
 
     // ─── 401: Token refresh flow ───────────────────────────────────────────
+
+    // Track consecutive bad-credential 401s on the login endpoint so the
+    // client can surface a UX lockout countdown. This is NOT a security control;
+    // an attacker can bypass it by clearing storage or calling the API directly.
+    // The real protection is server-side rate limiting per account and per IP.
+    if (status === 401 && originalRequest.url?.includes('/auth/login') && !originalRequest._retry) {
+      useAppStore.getState().incrementAuthFailure();
+    }
 
     if (
       status === 401 &&
@@ -310,6 +533,25 @@ apiClient.interceptors.response.use(
 
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
+          if (refreshQueue.length >= MAX_QUEUE_SIZE) {
+            const overflowError = new Error('Session expired due to refresh queue overflow.');
+            const elapsedMs = refreshStartTime ? Date.now() - refreshStartTime : 0;
+
+            sentryContextService.captureException(overflowError, {
+              tags: { 'auth.refresh_queue_overflow': 'true' },
+              extra: {
+                queueDepth: refreshQueue.length,
+                elapsedRefreshMs: elapsedMs,
+              },
+            });
+
+            useAppStore.getState().setSessionExpiredModalVisible(true);
+            useAppStore.getState().logout();
+
+            processRefreshQueue(null, overflowError);
+
+            return reject(overflowError);
+          }
           refreshQueue.push({
             resolve: (token: string) => {
               originalRequest.headers.Authorization = `Bearer ${token}`;
@@ -321,6 +563,7 @@ apiClient.interceptors.response.use(
       }
 
       isRefreshing = true;
+      refreshStartTime = Date.now();
 
       try {
         const refreshToken = await getRefreshToken();
@@ -340,10 +583,16 @@ apiClient.interceptors.response.use(
 
         return apiClient(originalRequest);
       } catch (refreshError) {
+        // Three consecutive refresh 401s indicate the refresh token is invalid;
+        // force a full logout rather than leaving the user in a broken auth state.
+        if ((refreshError as AxiosError)?.response?.status === 401) {
+          useAppStore.getState().incrementRefreshFailure();
+        }
         processRefreshQueue(null, refreshError);
         return Promise.reject(refreshError);
       } finally {
         isRefreshing = false;
+        refreshStartTime = 0;
       }
     }
 
@@ -372,37 +621,26 @@ apiClient.interceptors.response.use(
     // - entityId: identifier of the conflicting entity
 
     if (status === 409) {
-      const responseData = error.response?.data as
-        | {
-            serverVersion?: unknown;
-            serverVersionNumber?: number;
-            localVersion?: unknown;
-            entityType?: string;
-            entityId?: string;
-            message?: string;
-          }
-        | undefined;
+      // #806: validate response shape at runtime before accessing fields.
+      const rawData = error.response?.data;
+      const responseData = isConflictResponseShape(rawData) ? rawData : undefined;
+      if (rawData !== undefined && !isConflictResponseShape(rawData)) {
+        sentryContextService.captureException(new Error('409 response body has unexpected shape'), {
+          extra: { rawData: String(rawData).slice(0, 200) },
+          tags: { 'api.error': 'conflict_shape_mismatch' },
+        });
+      }
 
-      // Extract version metadata from request headers
-      const clientVersionHeader = originalRequest.headers?.['X-Last-Known-Version'];
-      const clientTimestampHeader = originalRequest.headers?.['X-Client-Timestamp'];
-      const entityTypeHeader = originalRequest.headers?.['X-Entity-Type'];
-      const entityIdHeader = originalRequest.headers?.['X-Entity-Id'];
-
-      const conflictData: ConflictData = {
-        id: `conflict_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        entityId: responseData?.entityId ?? String(entityIdHeader ?? ''),
-        entityType: responseData?.entityType ?? String(entityTypeHeader ?? 'unknown'),
-        localData: originalRequest.data,
-        serverData: responseData?.serverVersion,
-        localVersion: clientVersionHeader ? Number(clientVersionHeader) : undefined,
-        serverVersion: responseData?.serverVersionNumber,
-        clientTimestamp: clientTimestampHeader ? Number(clientTimestampHeader) : Date.now(),
-        serverTimestamp: Date.now(),
-        endpoint: originalRequest.url ?? '',
-        method: (originalRequest.method ?? 'UNKNOWN').toUpperCase(),
-        detectedAt: Date.now(),
-      };
+      // Build conflict record using the centralised detection utility
+      const conflictData = buildConflictDataFromHttpError({
+        responseData,
+        requestConfig: {
+          data: originalRequest.data,
+          url: originalRequest.url ?? '',
+          method: originalRequest.method ?? 'UNKNOWN',
+          headers: originalRequest.headers as Record<string, unknown>,
+        },
+      });
 
       appLogger.warnSync('409 Conflict - mutation conflicts with server state', {
         endpoint: originalRequest.url,
@@ -427,6 +665,36 @@ apiClient.interceptors.response.use(
     // ─── 429: Rate limit (exponential backoff) ─────────────────────────────
 
     if (status === 429) {
+      const isLoginRequest = originalRequest.url?.includes('/auth/login');
+
+      if (isLoginRequest) {
+        const retryAfterHeader = error.response?.headers?.['retry-after'];
+        const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
+
+        if (retryAfterMs) {
+          const lockUntil = Date.now() + retryAfterMs;
+          useAppStore.getState().setAuthLockedUntil(lockUntil);
+          appLogger.warnSync('Login rate-limited by server; honouring Retry-After', {
+            retryAfterMs,
+            lockUntil,
+            endpoint: originalRequest.url,
+          });
+        } else {
+          appLogger.warnSync(
+            'Login rate-limited but no Retry-After header; applying default UX lockout',
+            {
+              endpoint: originalRequest.url,
+            }
+          );
+        }
+
+        return Promise.reject({
+          message: 'Too many login attempts. Please wait before trying again.',
+          status: 429,
+          code: 'RATE_LIMIT_EXCEEDED',
+        });
+      }
+
       originalRequest._retryCount = originalRequest._retryCount || 0;
 
       if (originalRequest._retryCount < MAX_RATE_LIMIT_RETRIES) {
@@ -473,8 +741,25 @@ apiClient.interceptors.response.use(
 
     if (status && status >= 500) {
       originalRequest._retryCount = originalRequest._retryCount || 0;
+      const method = originalRequest.method?.toUpperCase();
 
-      if (originalRequest._retryCount < MAX_SERVER_ERROR_RETRIES) {
+      // Only retry idempotent methods by default. Non-idempotent mutations (POST)
+      // require an Idempotency-Key header to be retried safely.
+      const isIdempotent = method === undefined || IDEMPOTENT_METHODS.has(method);
+      const hasIdempotencyKey = Boolean(originalRequest.headers?.['Idempotency-Key']);
+
+      // Initialize deadline on first failure
+      if (!originalRequest._retryDeadlineAt) {
+        originalRequest._retryDeadlineAt = Date.now();
+      }
+      const elapsedSinceFirstFailure = Date.now() - originalRequest._retryDeadlineAt;
+      const withinDeadline = elapsedSinceFirstFailure < RETRY_DEADLINE_MS;
+
+      if (
+        originalRequest._retryCount < MAX_SERVER_ERROR_RETRIES &&
+        (isIdempotent || hasIdempotencyKey) &&
+        withinDeadline
+      ) {
         const attempt = originalRequest._retryCount;
         originalRequest._retryCount += 1;
 
@@ -487,6 +772,7 @@ apiClient.interceptors.response.use(
             method: originalRequest.method,
             attempt: originalRequest._retryCount,
             delayMs: delayTime,
+            elapsedMs: elapsedSinceFirstFailure,
           }
         );
 
@@ -502,6 +788,14 @@ apiClient.interceptors.response.use(
           method: originalRequest.method,
         }
       );
+
+      // Record timing on terminal failure
+      if (originalRequest._timingFinish) {
+        const entry = originalRequest._timingFinish(false, status);
+        entry.retryCount = originalRequest._retryCount ?? 0;
+        notifyEntry(entry);
+        originalRequest._timingFinish = undefined;
+      }
 
       return Promise.reject({
         message: 'Server error. Please try again later.',
@@ -527,7 +821,19 @@ apiClient.interceptors.response.use(
 
     // ─── Default fallback ──────────────────────────────────────────────────
 
-    return Promise.reject(error);
+    sentryContextService.captureException(error, {
+      tags: { 'api.error': 'unhandled_response' },
+      contexts: {
+        request: {
+          url: originalRequest?.url,
+          method: originalRequest?.method?.toUpperCase(),
+          status: status ?? null,
+        },
+      },
+      fingerprint: ['api-unhandled-error', String(status ?? 'unknown')],
+    });
+
+    return Promise.reject(buildSanitizedApiError(status, error.code));
   }
 );
 

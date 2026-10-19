@@ -1,15 +1,102 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
+# Cancel in-progress runs for the same workflow and branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Restrict default GITHUB_TOKEN permissions (fix for issue #924)
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
+  test-e2e:
+    runs-on: ubuntu-latest
+    # Skip E2E when secrets are absent
+    if: ${{ secrets.MAESTRO_API_KEY != '' && secrets.EXPO_TOKEN != '' }}
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Build Android preview APK via EAS
+        run: eas build --platform android --profile preview --non-interactive --no-wait
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          GIT_WORKAROUND: 'true'
+
+      - name: Wait for EAS build
+        id: eas-build
+        run: |
+          BUILD_ID=$(eas build:list --platform android --limit 1 --json --non-interactive | jq -r '.[0].id')
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "Waiting for EAS build $BUILD_ID to complete..."
+          while true; do
+            STATUS=$(eas build:view $BUILD_ID --json --non-interactive | jq -r '.status')
+            if [ "$STATUS" = 'finished' ]; then
+              echo "Build finished"
+              break
+            elif [ "$STATUS" = 'errored' ] || [ "$STATUS" = 'canceled' ]; then
+              echo "Build failed with status: $STATUS"
+              exit 1
+            fi
+            echo "Build status: $STATUS — waiting 60s..."
+            sleep 60
+          done
+
+      - name: Download APK artifact
+        run: |
+          BUILD_ID=${{ steps.eas-build.outputs.build_id }}
+          eas build:download --id $BUILD_ID --platform android --path ./app.apk --non-interactive
+
+      - name: Install Maestro CLI
+        run: curl -Ls "https://get.maestro.mobile.dev" | bash
+
+      - name: Run Maestro E2E tests
+        run: |
+          export PATH="$HOME/.maestro/bin:$PATH"
+          maestro test maestro/ --format junit --output maestro-results.xml || MAESTRO_EXIT=$?
+          echo "maestro_exit=$MAESTRO_EXIT" >> "$GITHUB_OUTPUT"
+          exit 0  # Don't fail yet — upload artifacts first
+        id: maestro
+        continue-on-error: true
+
+      - name: Upload Maestro results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maestro-results
+          path: |
+            maestro-results.xml
+            maestro/**/*.png
+          retention-days: 14
+
+      - name: Fail if Maestro tests failed
+        if: steps.maestro.outputs.maestro_exit != '0'
+        run: |
+          echo "Maestro E2E tests failed (exit code: ${{ steps.maestro.outputs.maestro_exit }})"
+          exit 1
   ci:
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+
     env:
       EXPO_PUBLIC_API_BASE_URL: https://api.teachlink.com
       EXPO_PUBLIC_SOCKET_URL: wss://api.teachlink.com
@@ -17,46 +104,162 @@ jobs:
       EXPO_PUBLIC_ENABLE_PUSH_NOTIFICATIONS: true
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt', 'scripts/subset-fonts.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install subsetting dependencies
-        run: pip install fonttools
+        run: pip install -r requirements.txt
 
-      - name: Run Font Subsetting
-        run: python scripts/subset-fonts.py
-
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          cache: 'npm'
 
-      - run: npm install
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Cache subsetted fonts
+        id: cache-fonts
+        uses: actions/cache@v4
+        with:
+          path: |
+            assets/fonts/*.ttf
+            !assets/fonts/original/*.ttf
+          key: ${{ runner.os }}-fonts-${{ hashFiles('assets/fonts/original/*.ttf', 'scripts/subset-fonts.py', 'requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-fonts-
+
+      - name: Run Font Subsetting
+        if: steps.cache-fonts.outputs.cache-hit != 'true'
+        run: python scripts/subset-fonts.py
+
+      - name: Cache TypeScript build info
+        uses: actions/cache@v4
+        with:
+          path: |
+            .tsbuildinfo
+            **/.tsbuildinfo
+          key: ${{ runner.os }}-typescript-${{ hashFiles('tsconfig.json', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-typescript-
+
+      - name: Cache Jest
+        uses: actions/cache@v4
+        with:
+          path: |
+            .jest-cache
+            coverage
+          key: ${{ runner.os }}-jest-${{ hashFiles('jest.config.js', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-jest-
+
+      - name: Cache Expo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.expo
+            .expo
+            .expo-shared
+          key: ${{ runner.os }}-expo-${{ hashFiles('app.json', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-expo-
+
+      - name: Cache Metro bundler
+        uses: actions/cache@v4
+        with:
+          path: |
+            .metro-cache
+            node_modules/.cache/metro
+          key: ${{ runner.os }}-metro-${{ hashFiles('metro.config.js', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-metro-
+
+      - name: Cache ESLint
+        uses: actions/cache@v4
+        with:
+          path: .eslintcache
+          key: ${{ runner.os }}-eslint-${{ hashFiles('eslint.config.js', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-eslint-
+
+      - name: Check for console.* violations
+        run: |
+          VIOLATIONS=$(grep -rn "console\." src/ \
+            --include='*.ts' \
+            --include='*.tsx' \
+            --exclude='logger.ts' \
+            --exclude='logger.*.ts' \
+            --exclude='cli.ts' \
+            --exclude='*.test.ts' \
+            --exclude='*.test.tsx' \
+            --exclude='*.spec.ts' \
+            --exclude='*.spec.tsx' \
+            --exclude-dir='__tests__' \
+            || true)
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo ""
+            echo "? console.* usage detected. Use src/utils/logger instead."
+            echo ""
+            echo "$VIOLATIONS" | while IFS= read -r line; do
+              echo "  $line"
+            done
+            echo ""
+            echo "See CONTRIBUTING.md for the logging level guide."
+            exit 1
+          fi
+
+          echo "? No console.* violations found."
 
       - name: Lint
-        run: npm run lint -- --max-warnings=500
+        run: npm run lint -- --cache --max-warnings=$(node -p "require('./lint-budget.json').maxWarnings") --cache-location .eslintcache
+
+      - name: Enforce lint budget ratchet
+        run: npm run lint:budget
 
       - name: Format check
         run: npm run format:check
 
       - name: Typecheck
-        run: npx tsc --noEmit
+        run: npx tsc --noEmit --incremental
 
       - name: Test
-        run: npm test -- --passWithNoTests
+        run: npm test -- --cache --cacheDirectory=.jest-cache
 
       - name: Validate OpenAPI Spec
         run: npm run validate:openapi
 
-      # ==============================
-      # 🚀 PERFORMANCE BUDGET CHECKS
-      # ==============================
+      - name: Run contract tests
+        run: npm test -- --testPathPattern='openapi.contract|validation' --cache --cacheDirectory=.jest-cache
 
-      - name: Build App (required for bundle check)
+      - name: Cache Expo build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist
+            .expo/web
+          key: ${{ runner.os }}-expo-build-${{ hashFiles('app/**/*', 'src/**/*', 'package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-expo-build-
+
+      - name: Build App (Web)
         run: npx expo export --platform web
 
       - name: Check Bundle Size
@@ -64,3 +267,13 @@ jobs:
 
       - name: Check API Performance
         run: node scripts/checkApiPerf.js
+
+      - name: Report cache statistics
+        if: always()
+        run: |
+          echo "## Cache Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Cache | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Node Modules | ${{ steps.cache-node-modules.outputs.cache-hit == 'true' && 'Hit' || 'Miss' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fonts | ${{ steps.cache-fonts.outputs.cache-hit == 'true' && 'Hit' || 'Miss' }} |" >> $GITHUB_STEP_SUMMARY

@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import type { ApiClient } from '../../types/apiClient';
 import { InternalAxiosRequestConfig } from 'axios';
 import * as Network from 'expo-network';
 
@@ -26,6 +27,11 @@ export interface QueuedRequest {
   entityType?: string;
   /** Entity ID for conflict resolution */
   entityId?: string;
+  /**
+   * #813: Deterministic fingerprint of method+URL+body.
+   * Duplicate requests sharing the same fingerprint are suppressed in addToQueue.
+   */
+  fingerprint?: string;
 }
 
 interface BatchGroup {
@@ -46,6 +52,12 @@ interface QueueMetrics {
 const QUEUE_KEY = '@teachlink_request_queue';
 const QUEUE_METRICS_KEY = '@teachlink_request_queue_metrics';
 const MONITOR_INTERVAL_MS = 10000;
+/**
+ * Maximum number of requests the queue will hold.
+ * When exceeded, the oldest low-priority request is evicted first,
+ * then normal, then high. Critical requests are never evicted.
+ */
+const MAX_QUEUE_SIZE = 100;
 const PRIORITY_ORDER: Record<RequestPriority, number> = {
   critical: 0,
   high: 1,
@@ -59,7 +71,9 @@ class RequestQueue {
   private listeners: ((count: number) => void)[] = [];
   private monitoringInterval: ReturnType<typeof setInterval> | null = null;
   private networkListener: (() => void) | null = null;
-  private apiClient: any | null = null;
+  // #802: typed as ApiClient to prevent passing arbitrary objects
+  private apiClient: ApiClient | null = null;
+  private droppedCount = 0;
   private metrics: QueueMetrics = {
     totalQueued: 0,
     byPriority: { critical: 0, high: 0, normal: 0, low: 0 },
@@ -83,6 +97,23 @@ class RequestQueue {
       const method = (config.method ?? 'GET').toUpperCase();
       const endpoint = config.url ?? '/unknown';
 
+      // #813: Suppress duplicate mutations queued during the same offline session.
+      // Two requests are duplicates if they share the same method, URL, and body.
+      const fp = this.fingerprint(config);
+      const existing = queue.find(r => r.fingerprint === fp);
+      if (existing) {
+        // For GET requests, replace the existing entry with the newest version
+        // so reconnection replays only the most recent read.
+        if (method === 'GET') {
+          const idx = queue.indexOf(existing);
+          queue.splice(idx, 1);
+          logger.info(`RequestQueue: GET ${endpoint} collapsed — replaced older entry ${existing.id}`);
+        } else {
+          logger.info(`RequestQueue: duplicate ${method} ${endpoint} suppressed — returning existing id ${existing.id}`);
+          return existing.id;
+        }
+      }
+
       const queuedRequest: QueuedRequest = {
         id: this.generateId(),
         config,
@@ -96,10 +127,28 @@ class RequestQueue {
         clientTimestamp: Date.now(),
         entityType: versionMetadata?.entityType,
         entityId: versionMetadata?.entityId,
+        fingerprint: fp,
       };
 
       queue.push(queuedRequest);
       this.sortByPriority(queue);
+
+      // Evict oldest non-critical requests when over capacity
+      while (queue.length > MAX_QUEUE_SIZE) {
+        // Find the oldest evictable request (skip critical)
+        const evictIdx = queue.findIndex(r => r.priority !== 'critical');
+        if (evictIdx === -1) break; // all critical — stop evicting
+        const evicted = queue.splice(evictIdx, 1)[0];
+        this.droppedCount++;
+        this.metrics.byPriority[evicted.priority] = Math.max(
+          0,
+          this.metrics.byPriority[evicted.priority] - 1
+        );
+        logger.warn(
+          `RequestQueue: evicted [${evicted.priority}] ${evicted.method} ${evicted.endpoint} (queue full, dropped #${this.droppedCount})`
+        );
+      }
+
       await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
 
       this.metrics.totalQueued++;
@@ -187,7 +236,7 @@ class RequestQueue {
     }
   }
 
-  async processQueue(apiClient?: any): Promise<void> {
+  async processQueue(apiClient?: ApiClient): Promise<void> {
     if (this.isProcessing) return;
 
     if (apiClient) {
@@ -268,7 +317,7 @@ class RequestQueue {
       .catch(() => {});
   }
 
-  startMonitoring(apiClient?: any): void {
+  startMonitoring(apiClient?: ApiClient): void {
     if (apiClient) {
       this.apiClient = apiClient;
     }
@@ -354,6 +403,11 @@ class RequestQueue {
     return () => {
       this.listeners = this.listeners.filter(l => l !== listener);
     };
+  }
+
+  /** Number of requests evicted due to MAX_QUEUE_SIZE since app start. */
+  getDroppedCount(): number {
+    return this.droppedCount;
   }
 
   private createBatches(requests: QueuedRequest[]): BatchGroup[] {
@@ -547,8 +601,27 @@ class RequestQueue {
     return config;
   }
 
+  /**
+   * #813: Deterministic fingerprint for deduplication.
+   * Identical method + URL + serialized body → same fingerprint.
+   */
+  private fingerprint(config: InternalAxiosRequestConfig): string {
+    const method = (config.method ?? 'GET').toUpperCase();
+    const url = config.url ?? '/unknown';
+    // Serialize body deterministically; fall back to empty string for GET/HEAD
+    let body = '';
+    if (config.data !== undefined && config.data !== null) {
+      try {
+        body = typeof config.data === 'string' ? config.data : JSON.stringify(config.data);
+      } catch {
+        body = String(config.data);
+      }
+    }
+    return `${method}:${url}:${body}`;
+  }
+
   private generateId(): string {
-    return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    return `req_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
   }
 }
 

@@ -1,3 +1,4 @@
+import { appLogger } from '../../utils/logger';
 /**
  * Network & Dependency Performance Analyzer
  * Analyzes network requests, dependencies, and related optimizations
@@ -125,7 +126,7 @@ export class NetworkAnalyzer implements IPerformanceAnalyzer {
         }
       }
     } catch (error) {
-      console.error('Error analyzing endpoints:', error);
+      appLogger.errorSync('Error analyzing endpoints:', error);
     }
 
     return endpoints.sort((a, b) => b.avgLatency - a.avgLatency).slice(0, 10);
@@ -173,7 +174,7 @@ export class NetworkAnalyzer implements IPerformanceAnalyzer {
         }
       }
     } catch (error) {
-      console.error('Error finding redundant requests:', error);
+      appLogger.errorSync('Error finding redundant requests:', error);
     }
 
     return requests;
@@ -216,7 +217,7 @@ export class NetworkAnalyzer implements IPerformanceAnalyzer {
 
       walkDir(assetsPath);
     } catch (error) {
-      console.error('Error finding unoptimized assets:', error);
+      appLogger.errorSync('Error finding unoptimized assets:', error);
     }
 
     return assets.sort((a, b) => b.savings - a.savings).slice(0, 10);
@@ -436,7 +437,7 @@ export class DependencyAnalyzer implements IPerformanceAnalyzer {
         }
       }
     } catch (error) {
-      console.error('Error finding transitive deps:', error);
+      appLogger.errorSync('Error finding transitive deps:', error);
     }
 
     return deps.sort((a, b) => b.totalSize - a.totalSize).slice(0, 10);
@@ -444,48 +445,77 @@ export class DependencyAnalyzer implements IPerformanceAnalyzer {
 
   /**
    * Check license compliance
+   *
+   * Mirrors the authoritative CI policy (scripts/license-audit.js + the
+   * `license:check` npm script): scans the *production* dependency tree and
+   * fails on any package whose license is not on the allowlist declared in
+   * `license-allowlist.json`, unless the package is listed under an approved
+   * exception in `license-exceptions.json`. "UNKNOWN" licenses are never
+   * allowed. Keeping this in sync with the allowlist files means the in-app
+   * auditor and the merge gate agree.
    */
   private async checkLicenseCompliance(): Promise<LicenseIssue[]> {
     const issues: LicenseIssue[] = [];
-    const problematicLicenses = ['AGPL', 'SSPL', 'GPLv3'];
-
     const pkgJsonPath = path.join(this.projectRoot, 'package.json');
+    const allowlistPath = path.join(this.projectRoot, 'license-allowlist.json');
+    const exceptionsPath = path.join(this.projectRoot, 'license-exceptions.json');
 
     if (!fs.existsSync(pkgJsonPath)) return [];
 
+    let allowlist: string[] = [];
+    try {
+      allowlist = JSON.parse(fs.readFileSync(allowlistPath, 'utf-8'));
+    } catch {
+      appLogger.errorSync('Error reading license-allowlist.json');
+      return [];
+    }
+
+    let exceptions: Record<string, string> = {};
+    try {
+      exceptions = JSON.parse(fs.readFileSync(exceptionsPath, 'utf-8')).packages ?? {};
+    } catch {
+      // No exceptions file: rely purely on the allowlist.
+      exceptions = {};
+    }
+
+    const isAllowed = (pkgName: string, license?: unknown): boolean => {
+      if (exceptions[pkgName]) return true;
+      if (!license) return false;
+      const fragments = String(license)
+        .trim()
+        .split(/\s+(?:and|or)\s+/i)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (fragments.length === 0) return false;
+      return fragments.every((f) => allowlist.includes(f));
+    };
+
     try {
       const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-      const allDeps = {
-        ...pkgJson.dependencies,
-        ...pkgJson.devDependencies,
-      };
-
-      for (const [name] of Object.entries(allDeps)) {
+      // Production scope only — devDependencies do not ship to the stores.
+      for (const name of Object.keys(pkgJson.dependencies ?? {})) {
         const pkgPath = path.join(this.projectRoot, 'node_modules', name, 'package.json');
 
-        if (fs.existsSync(pkgPath)) {
-          try {
-            const depPkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-            const license = depPkg.license || 'UNKNOWN';
+        if (!fs.existsSync(pkgPath)) continue;
 
-            for (const problematic of problematicLicenses) {
-              if (license.includes(problematic)) {
-                issues.push({
-                  packageName: name,
-                  license,
-                  status: 'violation',
-                  reason: `${problematic} license is not compatible with this project`,
-                });
-                break;
-              }
-            }
-          } catch {
-            // Ignore
+        try {
+          const depPkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+          const license = depPkg.license || depPkg.licenses || 'UNKNOWN';
+
+          if (!isAllowed(name, license)) {
+            issues.push({
+              packageName: name,
+              license: String(license),
+              status: 'violation',
+              reason: `license not on allowlist (${allowlist.join(', ')}): ${String(license)}`,
+            });
           }
+        } catch {
+          // Ignore packages we cannot resolve locally.
         }
       }
     } catch (error) {
-      console.error('Error checking licenses:', error);
+      appLogger.errorSync('Error checking licenses:', error);
     }
 
     return issues;
@@ -528,3 +558,4 @@ export class DependencyAnalyzer implements IPerformanceAnalyzer {
     return size;
   }
 }
+

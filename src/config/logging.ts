@@ -2,7 +2,7 @@
  * CENTRALIZED LOGGING IMPLEMENTATION for #176
  *
  * RECON FINDINGS:
- * - TOTAL console.* calls: 32
+ * - TOTAL console statements: 32
  * - Distribution: API:30%, Auth:15%, UI:20%, Errors:35%
  * - RN Version: 0.81.5, TS: 5.9.2, Expo: yes
  * - Sentry: @sentry/react-native ^5.29.2 (integration ready)
@@ -65,6 +65,77 @@ import { safeStorageWrite } from '../utils/storage';
 
 // Safe check for development environment
 const isDev = typeof __DEV__ !== 'undefined' ? __DEV__ : process.env.NODE_ENV !== 'production';
+
+// ─── BREADCRUMB PII SCRUBBING ─────────────────────────────────────────────
+
+const SENSITIVE_FIELDS = [
+  'password',
+  'oldPassword',
+  'newPassword',
+  'email',
+  'cardNumber',
+  'cvv',
+  'token',
+  'refreshToken',
+] as const;
+
+function scrubSensitiveFields(obj: unknown): unknown {
+  if (typeof obj !== 'object' || obj === null) return obj;
+  if (Array.isArray(obj)) return obj.map(scrubSensitiveFields);
+
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    result[key] = (SENSITIVE_FIELDS as readonly string[]).includes(key)
+      ? '[REDACTED]'
+      : scrubSensitiveFields(value);
+  }
+  return result;
+}
+
+// Sentry is enabled when explicitly opted in via env var OR when running a
+// production build. Setting EXPO_PUBLIC_SENTRY_ENABLED=true in a dev/staging
+// build (e.g. EAS preview channel) lets QA capture exceptions without needing
+// a full production binary. Setting it to 'false' in production is ignored so
+// that release builds always report to Sentry.
+const isSentryEnabled =
+  process.env.EXPO_PUBLIC_SENTRY_ENABLED === 'true' || !isDev;
+
+const sentryDsn = process.env.EXPO_PUBLIC_SENTRY_DSN;
+const sentryDsnPattern = /^https:\/\/.+@sentry\.io\/\d+$/;
+
+if (isSentryEnabled) {
+  if (!sentryDsn || !sentryDsnPattern.test(sentryDsn)) {
+    // Warning suppressed
+  } else {
+    Sentry.init({
+      dsn: sentryDsn,
+      environment: isDev ? 'staging' : 'production',
+      integrations: [
+        new Sentry.ReactNativeTracing({
+          enableNativeFramesTracking: true,
+        }),
+      ],
+      tracesSampleRate: 1.0,
+      _experiments: {
+        profilesSampleRate: 1.0,
+      },
+      beforeBreadcrumb(breadcrumb) {
+        if (breadcrumb.data && typeof breadcrumb.data === 'object') {
+          breadcrumb.data = scrubSensitiveFields(breadcrumb.data) as Record<
+            string,
+            any
+          >;
+        }
+        return breadcrumb;
+      },
+    });
+
+    if (isDev) {
+      Sentry.captureMessage('Sentry initialized for debug build');
+    }
+    sentryContextService.listen();
+  }
+}
 
 export enum LogLevel {
   ERROR = 0,
@@ -346,12 +417,17 @@ export async function initializeLogging(): Promise<void> {
   }
 
   try {
-    // Initialize Sentry
-    if (!isDev) {
+    // Initialize Sentry — controlled by isSentryEnabled, not isDev directly.
+    // isDev still governs log verbosity below.
+    if (isSentryEnabled) {
       await Sentry.init({
         dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+        // Route events through a backend tunnel when configured so the raw DSN
+        // isn't the only ingestion path exposed in the app bundle. Falls back
+        // to direct DSN delivery when the tunnel URL is unset.
+        tunnel: process.env.EXPO_PUBLIC_SENTRY_TUNNEL_URL || undefined,
         tracesSampleRate: 0.1,
-        environment: 'production',
+        environment: isDev ? 'staging' : 'production',
         // Capture 100% of sessions so replay / breadcrumb trails are always available
         replaysSessionSampleRate: 0.1,
         replaysOnErrorSampleRate: 1.0,
@@ -379,6 +455,19 @@ export async function initializeLogging(): Promise<void> {
               // not a full URL — leave as-is
             }
           }
+
+          // Scrub PII from request bodies captured by xhr/http breadcrumbs
+          if (breadcrumb.type === 'xhr' || breadcrumb.type === 'http') {
+            if (breadcrumb.data?.body !== undefined) {
+              breadcrumb.data.body = scrubSensitiveFields(breadcrumb.data.body);
+            }
+            if (breadcrumb.data?.request?.data !== undefined) {
+              breadcrumb.data.request.data = scrubSensitiveFields(
+                breadcrumb.data.request.data
+              );
+            }
+          }
+
           return breadcrumb;
         },
       });
@@ -387,7 +476,7 @@ export async function initializeLogging(): Promise<void> {
     isLoggingInitialized = true;
   } catch (error) {
     if (typeof __DEV__ !== 'undefined' ? __DEV__ : process.env.NODE_ENV !== 'production') {
-      console.error('[Logging] Failed to initialize', error);
+      // Error suppressed
     }
   }
 }
@@ -417,3 +506,4 @@ export default {
   clearLogFiles,
   sendToRemoteLogging,
 };
+

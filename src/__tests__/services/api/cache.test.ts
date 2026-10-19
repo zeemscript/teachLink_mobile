@@ -1,18 +1,18 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import {
-    clearCache,
-    fetchWithSWR,
-    getCache,
-    getCacheStats,
-    getCacheStatus,
-    invalidateCacheByDataVersion,
-    invalidateCacheByTags,
-    invalidateCacheForBatchRequests,
-    invalidateCacheForMutation,
-    resetCacheStats,
-    setCache,
-    setMaxCacheSize,
+  clearCache,
+  fetchWithSWR,
+  getCache,
+  getCacheStats,
+  getCacheStatus,
+  invalidateCacheByDataVersion,
+  invalidateCacheByTags,
+  invalidateCacheForBatchRequests,
+  invalidateCacheForMutation,
+  resetCacheStats,
+  setCache,
+  setMaxCacheSize,
 } from '../../../services/api/cache';
 
 const mockedAsyncStorage = AsyncStorage as jest.Mocked<typeof AsyncStorage>;
@@ -84,6 +84,53 @@ describe('LRU cache eviction and stats', () => {
     expect(getCache('k4')).toBe('val4');
   });
 
+  it('preserves frequently-read entries over rarely-read ones during eviction', () => {
+    setMaxCacheSize(500);
+
+    setCache('read-heavy', 'val1', 60_000, 300_000);
+    setCache('write-only', 'val2', 60_000, 300_000);
+
+    // Read the read-heavy entry many times to promote it
+    for (let i = 0; i < 5; i++) {
+      getCache('read-heavy');
+    }
+
+    // Add a new entry to trigger eviction
+    setCache('new-entry', 'val3', 60_000, 300_000);
+
+    // write-only should be evicted since read-heavy was accessed more recently
+    expect(getCache('read-heavy')).toBe('val1');
+    expect(getCache('write-only')).toBeNull();
+    expect(getCache('new-entry')).toBe('val3');
+  });
+
+  it('evicts non-critical entries before critical ones', () => {
+    setMaxCacheSize(500);
+
+    setCache('critical-entry', 'val1', 60_000, 300_000, { critical: true });
+    setCache('normal-entry', 'val2', 60_000, 300_000, { critical: false });
+
+    // Add entries to force eviction
+    setCache('extra1', 'val3', 60_000, 300_000);
+    setCache('extra2', 'val4', 60_000, 300_000);
+
+    // Critical entry should survive
+    expect(getCache('critical-entry')).toBe('val1');
+  });
+
+  it('tracks eviction stats', () => {
+    resetCacheStats();
+    setMaxCacheSize(500);
+
+    setCache('k1', 'val1', 60_000, 300_000);
+    setCache('k2', 'val2', 60_000, 300_000);
+    setCache('k3', 'val3', 60_000, 300_000);
+    setCache('k4', 'val4', 60_000, 300_000); // should trigger eviction
+
+    const stats = getCacheStats();
+    expect(stats.evictions).toBeGreaterThan(0);
+  });
+
   it('correctly tracks hits and misses stats', () => {
     resetCacheStats();
 
@@ -113,29 +160,32 @@ describe('LRU cache eviction and stats', () => {
 });
 
 describe('three-tier cache behavior', () => {
-  it('persists network results with cache metadata for the AsyncStorage tier', async () => {
+  it('keeps sensitive entries in memory without persisting them', async () => {
     setCache('users:u1', { id: 'u1', name: 'Ada' }, 60_000, 300_000, {
       dataType: 'user-profile',
       tags: ['users', 'user:u1'],
       critical: true,
+      persist: true,
+      sensitive: true,
     });
 
     await Promise.resolve();
     await Promise.resolve();
 
+    expect(mockedAsyncStorage.setItem).not.toHaveBeenCalled();
+    expect(getCache('users:u1')).toEqual({ id: 'u1', name: 'Ada' });
+  });
+
+  it('persists allowlisted course entries by default', async () => {
+    setCache('courses:course-1', { id: 'course-1', title: 'Math' }, 60_000, 300_000);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
     expect(mockedAsyncStorage.setItem).toHaveBeenCalledWith(
-      '@teachlink/api-cache:users%3Au1',
+      '@teachlink/api-cache:courses%3Acourse-1',
       expect.any(String)
     );
-
-    const [, rawEnvelope] = mockedAsyncStorage.setItem.mock.calls[0];
-    const envelope = JSON.parse(rawEnvelope);
-
-    expect(envelope.key).toBe('users:u1');
-    expect(envelope.entry.data).toEqual({ id: 'u1', name: 'Ada' });
-    expect(envelope.entry.tags).toEqual(['users', 'user:u1']);
-    expect(envelope.entry.dataType).toBe('user-profile');
-    expect(envelope.entry.critical).toBe(true);
   });
 
   it('hydrates from AsyncStorage before hitting the network', async () => {
@@ -151,6 +201,8 @@ describe('three-tier cache behavior', () => {
           tags: ['users', 'user:u1'],
           dataType: 'user-profile',
           critical: true,
+          persist: false,
+          sensitive: true,
           sizeBytes: 180,
         },
       })
@@ -194,9 +246,11 @@ describe('three-tier cache behavior', () => {
     setCache('users:u1', { id: 'u1', name: 'Ada' }, 60_000, 30_000);
     await new Promise(resolve => setTimeout(resolve, 5));
 
-    const fetcher = jest.fn().mockImplementation(
-      () => new Promise(resolve => setTimeout(() => resolve({ id: 'u1', name: 'Grace' }), 10))
-    );
+    const fetcher = jest
+      .fn()
+      .mockImplementation(
+        () => new Promise(resolve => setTimeout(() => resolve({ id: 'u1', name: 'Grace' }), 10))
+      );
 
     const responsePromise = fetchWithSWR('users:u1', fetcher, 1, 30_000);
 

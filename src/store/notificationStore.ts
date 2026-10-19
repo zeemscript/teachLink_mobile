@@ -10,6 +10,7 @@ import {
     NotificationType,
     StoredNotification,
 } from '../types/notifications';
+import { appLogger } from '../utils/logger';
 
 interface NotificationState {
   // Push token state
@@ -59,6 +60,14 @@ interface NotificationState {
 
   // Helpers
   isNotificationTypeEnabled: (type: NotificationType) => boolean;
+
+  // Badge sync
+  syncBadgeFromServer: (unreadCount: number) => void;
+  getLastBadgeSyncAt: () => number | null;
+
+  // Deep link
+  pendingDeepLink: string | null;
+  setPendingDeepLink: (route: string | null) => void;
 }
 
 const createInitialNotificationState = () => ({
@@ -74,6 +83,8 @@ const createInitialNotificationState = () => ({
   notificationHistory: [],
   lastEngagedAt: null,
   lastNotificationSentAtByType: {},
+  lastBadgeSyncAt: null as number | null,
+  pendingDeepLink: null,
 });
 
 let resetNotificationStoreAfterHydrationError = () => {};
@@ -290,6 +301,16 @@ export const useNotificationStore = create<NotificationState>()(
             return true;
         }
       },
+
+      // Badge sync
+      syncBadgeFromServer: (unreadCount: number) => {
+        set({ unreadCount, lastBadgeSyncAt: Date.now() });
+        appLogger.infoSync('Badge count synced from server', { unreadCount });
+      },
+      getLastBadgeSyncAt: () => get().lastBadgeSyncAt,
+
+      // Deep link
+      setPendingDeepLink: route => set({ pendingDeepLink: route }),
       };
     },
     {
@@ -345,6 +366,7 @@ export const useNotificationStore = create<NotificationState>()(
         notificationHistory: state.notificationHistory,
         lastEngagedAt: state.lastEngagedAt,
         lastNotificationSentAtByType: state.lastNotificationSentAtByType,
+        pendingDeepLink: state.pendingDeepLink,
       }),
     }
   )
@@ -424,5 +446,5 @@ function formatGroupedBody(existingBody: string, incomingBody: string, count: nu
 }
 
 function generateId(): string {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 }

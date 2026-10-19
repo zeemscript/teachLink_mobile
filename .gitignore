@@ -71,6 +71,11 @@ build/
 
 # Testing
 coverage/
+report/
+reports/
+
+# Scratch/build artifacts
+files.txt
 
 app-example
 
@@ -87,3 +92,4 @@ GoogleService-Info.plist
 !README.md
 !CONTRIBUTING.md
 !docs/**/*.md
+!Governance/**/*.md

@@ -1,0 +1,26 @@
+appId: com.teachlink
+---
+- launchApp:
+    clearState: true
+
+# Wait for login screen to load
+- waitForAnimationToEnd
+
+# Fill in credentials
+- tapOn: "Email"
+- inputText: "test@example.com"
+- tapOn: "Password"
+- inputText: "password123"
+
+# Submit login
+- tapOn: "Log In"
+
+# Assert successful login - should see home/dashboard
+- extendedWaitUntil:
+    visible: "Home"
+    timeout: 10000
+
+# Verify we landed on a main screen
+- assertVisible:
+    text: ".*(Home|Dashboard|Courses|Welcome).*"
+    optional: true

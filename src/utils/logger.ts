@@ -74,8 +74,11 @@ const LEVEL_EMOJI: Record<LogLevel, string> = {
 
 // ─── PRODUCTION BUILD INFORMATION ─────────────────────────────────────
 
-// @ts-ignore - Available in Expo/RN environment
-const APP_VERSION = typeof __EXPO_VERSION__ !== 'undefined' ? __EXPO_VERSION__ : '1.0.0';
+import Constants from 'expo-constants';
+import * as Crypto from 'expo-crypto';
+
+const APP_VERSION: string = (Constants.expoConfig?.version as string) ?? 'unknown';
+const SESSION_ID = Crypto.randomUUID();
 
 // ─── LOGGER IMPLEMENTATION ────────────────────────────────────────────────
 
@@ -156,7 +159,7 @@ class AppLogger {
       app: 'teachlink_mobile',
       version: APP_VERSION,
       environment: loggingConfig.isDev ? 'development' : 'production',
-      pid: String(process.pid || 0),
+      pid: SESSION_ID,
       userId: ctx.userId,
       requestId: ctx.requestId,
       component: ctx.component,
